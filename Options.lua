@@ -30,11 +30,30 @@ local function CreateLabel(parent, fontObject, text, anchor, relativeTo, relativ
 	return label
 end
 
+local function GetCheckButtonLabel(checkbox)
+	if not checkbox then
+		return nil
+	end
+
+	local label = checkbox.text or checkbox.Text
+	if label then
+		return label
+	end
+
+	label = checkbox:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+	label:SetPoint("LEFT", checkbox, "RIGHT", 2, 1)
+	checkbox.Text = label
+	return label
+end
+
 local function CreateCheckButton(parent, text, anchor, relativeTo, relativePoint, xOffset, yOffset, onClick)
 	local checkbox = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
 	checkbox:SetPoint(anchor, relativeTo, relativePoint, xOffset, yOffset)
-	checkbox.text:SetText(text)
-	checkbox.text:SetFontObject(GameFontHighlight)
+	local label = GetCheckButtonLabel(checkbox)
+	if label then
+		label:SetText(text)
+		label:SetFontObject(GameFontHighlight)
+	end
 	checkbox:SetScript("OnClick", onClick)
 	return checkbox
 end
@@ -495,14 +514,15 @@ function Options:Refresh()
 end
 
 function Options:Initialize()
-	if self.initialized then
+	if self.panel then
+		self.initialized = true
 		self:Refresh()
 		return
 	end
 
-	self.initialized = true
 	self:BuildPanel()
 	if self.panel then
+		self.initialized = true
 		self:Refresh()
 	end
 end

@@ -3347,8 +3347,27 @@ function Pane:PrepareOrders()
 end
 
 function Pane:GetCurrentProfessionID()
-	local info = C_TradeSkillUI.GetBaseProfessionInfo and C_TradeSkillUI.GetBaseProfessionInfo()
-	return info and info.profession or nil
+	local ordersPage = ProfessionsFrame and ProfessionsFrame.OrdersPage
+	local professionInfo = ordersPage and ordersPage.professionInfo
+	if professionInfo and professionInfo.profession then
+		return professionInfo.profession
+	end
+
+	if type(C_TradeSkillUI) == "table" and type(C_TradeSkillUI.GetChildProfessionInfo) == "function" then
+		professionInfo = C_TradeSkillUI.GetChildProfessionInfo()
+		if professionInfo and professionInfo.profession then
+			return professionInfo.profession
+		end
+	end
+
+	if type(C_TradeSkillUI) == "table" and type(C_TradeSkillUI.GetBaseProfessionInfo) == "function" then
+		professionInfo = C_TradeSkillUI.GetBaseProfessionInfo()
+		if professionInfo and professionInfo.profession then
+			return professionInfo.profession
+		end
+	end
+
+	return nil
 end
 
 function Pane:HideAllRows()
@@ -3716,8 +3735,7 @@ function Pane:RequestOrders(reason)
 		return
 	end
 
-	local professionInfo = C_TradeSkillUI.GetBaseProfessionInfo()
-	local profession = professionInfo and professionInfo.profession
+	local profession = self:GetCurrentProfessionID()
 	if not profession or not C_TradeSkillUI.IsNearProfessionSpellFocus(profession) then
 		return
 	end

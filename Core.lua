@@ -381,27 +381,50 @@ function ns.InitializeDatabase()
 	CopyDefaults(defaults, CraftingOrdersPlusPlusDB)
 end
 
-function ns.InitializeModules()
+local function SafeInitializeModule(module)
+	if not (module and type(module.Initialize) == "function") then
+		return
+	end
+
+	local errorHandler = geterrorhandler and geterrorhandler()
+	if type(errorHandler) == "function" then
+		xpcall(function()
+			module:Initialize()
+		end, errorHandler)
+	else
+		pcall(function()
+			module:Initialize()
+		end)
+	end
+end
+
+function ns.InitializeCommonModules()
+	if type(CraftingOrdersPlusPlusDB) ~= "table" then
+		ns.InitializeDatabase()
+	end
+
+	SafeInitializeModule(ns.Pricing)
+	SafeInitializeModule(ns.Options)
+end
+
+function ns.InitializeProfessionsModules()
 	if type(CraftingOrdersPlusPlusDB) ~= "table" then
 		ns.InitializeDatabase()
 	end
 
 	if not ns.IsProfessionsReady() then
 		if ns.IsAddonLoaded("Blizzard_Professions") then
-			C_Timer.After(0.1, ns.InitializeModules)
+			C_Timer.After(0.1, ns.InitializeProfessionsModules)
 		end
 		return
 	end
 
-	if ns.Pricing and ns.Pricing.Initialize then
-		ns.Pricing:Initialize()
-	end
-	if ns.Options and ns.Options.Initialize then
-		ns.Options:Initialize()
-	end
-	if ns.BrowsePane and ns.BrowsePane.Initialize then
-		ns.BrowsePane:Initialize()
-	end
+	SafeInitializeModule(ns.BrowsePane)
+end
+
+function ns.InitializeModules()
+	ns.InitializeCommonModules()
+	ns.InitializeProfessionsModules()
 end
 
 eventFrame:SetScript("OnEvent", function(_, eventName, ...)
@@ -410,7 +433,7 @@ eventFrame:SetScript("OnEvent", function(_, eventName, ...)
 		if loadedAddonName == addonName then
 			ns.InitializeDatabase()
 		elseif loadedAddonName == "Blizzard_Professions" then
-			C_Timer.After(0, ns.InitializeModules)
+			C_Timer.After(0, ns.InitializeProfessionsModules)
 		end
 	end
 
