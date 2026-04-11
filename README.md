@@ -1,5 +1,7 @@
 # Crafting Orders++
 
+[![GitHub](https://img.shields.io/badge/github-%23121011.svg?style=&logo=github&logoColor=white)](https://github.com/foodmuffin/CraftingOrders-)
+
 ## TL;DR
 
 Crafting Orders++ upgrades WoW's Patron crafting-orders tab with a cleaner list, reagent cost and reward value tracking, profit estimates, quality planning, shopping-list export, and better handling for unknown recipes. It is built for players who want to decide faster which patron orders are worth crafting and which materials they actually need to buy or save.
