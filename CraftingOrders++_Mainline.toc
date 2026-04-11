@@ -1,0 +1,29 @@
+## Interface: 120001
+## Title: Crafting Orders++
+## Author: OpenAI Codex
+## Version: 0.1.1
+## Notes: Improved patron crafting orders with pricing and shopping list tools.
+## Category: Professions
+## IconTexture: Interface\AddOns\CraftingOrders++\CraftingOrdersPP_Icon
+## Dependencies: Blizzard_Professions
+## OptionalDeps: Auctionator, Auc-Advanced, Auctioneer
+## SavedVariables: CraftingOrdersPlusPlusDB
+## LoadOnDemand: 1
+## LoadWith: Blizzard_Professions
+
+Locale.lua
+Locales\enUS.lua
+Locales\deDE.lua
+Locales\esES.lua
+Locales\esMX.lua
+Locales\frFR.lua
+Locales\itIT.lua
+Locales\koKR.lua
+Locales\ptBR.lua
+Locales\ruRU.lua
+Locales\zhCN.lua
+Locales\zhTW.lua
+Core.lua
+Pricing.lua
+Options.lua
+BrowsePane.lua
