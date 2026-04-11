@@ -46,29 +46,29 @@ It is especially helpful if you:
 
 These are the settings most players will care about:
 
-- `Pricing Addon`
+`Pricing Addon`
   Choose which detected addon should be used for pricing information. Only supported addons that are actually installed are shown.
 
-- `Grey out unknown patron recipes`
+`Grey out unknown patron recipes`
   Keeps unlearned recipes visible, but dims them clearly so they do not blend in with craftable orders.
 
-- `Show silver and copper in list money columns`
+`Show silver and copper in list money columns`
   By default the list stays compact and shows gold only. Enable this if you want full gold, silver, and copper values in the table.
 
-- `Patron Order Opening`
+`Patron Order Opening`
   Choose whether the addon should leave Blizzard's native reagent allocation alone or automatically turn off `Use Best Quality` and apply the planned material mix when opening a patron order from this list.
 
-- `Keep Don't Buy ingredient list per character`
+`Keep Don't Buy ingredient list per character`
   By default your `Don't Buy` exclusions are shared across characters. Turn this on if you want each character to manage their own list.
 
 ### Optional Pricing Support
 
 Crafting Orders++ works without pricing addons, but pricing-aware features are much more useful when one is installed.
 
-- `Auctionator`
+`Auctionator`
   Supports reagent cost, reward valuation, profit display, and shopping-list creation.
 
-- `Auctioneer`
+`Auctioneer`
   Supports reagent cost, reward valuation, profit display, and shopping export to Snatch when available.
 
 If no supported pricing addon is detected, the addon still improves the Patron list and recipe visibility, but price-based columns and shopping export will be limited.
