@@ -11,6 +11,7 @@ ns.EventFrame = eventFrame
 ns.Util = {}
 local IsAddOnLoadedAPI = C_AddOns and C_AddOns.IsAddOnLoaded or IsAddOnLoaded
 local GetAddOnMetadataAPI = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
+local CURSE_PROJECT_VERSION_TOKEN = "@project-version@"
 
 local defaults = {
 	pricingSource = "auctionator",
@@ -366,7 +367,15 @@ function ns.GetAddonMetadata(name, field)
 	end
 
 	local ok, value = pcall(GetAddOnMetadataAPI, name, field)
-	return ok and value or nil
+	if not ok then
+		return nil
+	end
+
+	if field == "Version" and value == CURSE_PROJECT_VERSION_TOKEN then
+		return "dev"
+	end
+
+	return value
 end
 
 function ns.IsProfessionsReady()

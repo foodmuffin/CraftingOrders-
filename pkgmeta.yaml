@@ -1,0 +1,8 @@
+package-as: CraftingOrders++
+
+ignore:
+  - AGENTS.md
+
+optional-dependencies:
+  - auctionator
+  - auctioneer
