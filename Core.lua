@@ -11,7 +11,7 @@ ns.EventFrame = eventFrame
 ns.Util = {}
 local IsAddOnLoadedAPI = C_AddOns and C_AddOns.IsAddOnLoaded or IsAddOnLoaded
 local GetAddOnMetadataAPI = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
-local CURSE_PROJECT_VERSION_TOKEN = "@project-version@"
+local CURSE_PROJECT_VERSION_TOKEN = "@project" .. "-version@"
 
 local defaults = {
 	pricingSource = "auctionator",

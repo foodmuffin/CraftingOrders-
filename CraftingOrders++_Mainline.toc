@@ -1,6 +1,6 @@
 ## Interface: 120001
 ## Title: Crafting Orders++
-## Author: OpenAI Codex
+## Author: @project-author@
 ## Version: @project-version@
 ## Notes: Improved patron crafting orders with pricing and shopping list tools.
 ## Category: Professions
