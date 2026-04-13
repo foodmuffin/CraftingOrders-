@@ -51,6 +51,8 @@ local CREATE_LIST_BUTTON_TOP_OFFSET = 19
 local REQUEST_COOLDOWN = 0.75
 local REQUEST_TIMEOUT = 12
 local REQUEST_SETTLE_DELAY = 0.25
+local REQUEST_READINESS_RETRY_DELAY = 0.15
+local REQUEST_READINESS_RETRY_LIMIT = 20
 local ITEM_DATA_REFRESH_DELAY = 0.75
 local INITIALIZE_RETRY_DELAY = 0.1
 local DONT_BUY_OVERLAY_TEXTURE = "Interface\\RaidFrame\\ReadyCheck-NotReady"
@@ -134,12 +136,14 @@ Pane.preparedOrderCache = {}
 Pane.rebuildGeneration = 0
 Pane.ordersGeneration = 0
 Pane.hasUnresolvedItemData = false
+Pane.unresolvedItemIDs = {}
 Pane.needsRequest = false
 Pane.needsRebuild = false
 Pane.needsRender = false
 Pane.pendingReason = nil
 Pane.pendingDueAt = nil
 Pane.visibleSessionId = 0
+Pane.requestReadinessRetryCount = 0
 
 local function FormatCount(count, alwaysShow)
 	if count and (count > 1 or (alwaysShow and count > 0)) then
@@ -1943,30 +1947,38 @@ local function IsItemDataPending(itemID)
 	return Util.GetItemName(itemID) == nil
 end
 
-local function OrderHasUnresolvedItemData(orderData)
+local function TrackUnresolvedItemID(unresolvedItemIDs, itemID)
+	if IsItemDataPending(itemID) then
+		unresolvedItemIDs[itemID] = true
+	end
+end
+
+local function CollectUnresolvedItemIDs(orderData)
+	local unresolvedItemIDs = {}
 	if not orderData then
-		return false
+		return unresolvedItemIDs
 	end
 
-	if IsItemDataPending(orderData.product and orderData.product.itemID) then
-		return true
-	end
+	TrackUnresolvedItemID(unresolvedItemIDs, orderData.product and orderData.product.itemID)
 
 	for _, rewardIcon in ipairs((orderData.reward and orderData.reward.icons) or EMPTY_LIST) do
-		if IsItemDataPending(rewardIcon.itemID) then
-			return true
-		end
+		TrackUnresolvedItemID(unresolvedItemIDs, rewardIcon.itemID)
 	end
 
 	for _, slotData in ipairs(orderData.requiredReagents or EMPTY_LIST) do
 		for _, option in ipairs(slotData.options or EMPTY_LIST) do
-			if IsItemDataPending(option.itemID) then
-				return true
-			end
+			TrackUnresolvedItemID(unresolvedItemIDs, option.itemID)
 		end
 	end
 
-	return false
+	return unresolvedItemIDs
+end
+
+local function OrderHasUnresolvedItemData(orderData)
+	if not orderData then
+		return false
+	end
+	return next(orderData.unresolvedItemIDs or EMPTY_LIST) ~= nil
 end
 
 local function PrepareOrder(rawOrder)
@@ -1999,6 +2011,7 @@ local function PrepareOrder(rawOrder)
 
 	BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedReagents)
 	orderData.profitValue, orderData.profitKnown, orderData.profitComplete = EvaluateProfit(orderData)
+	orderData.unresolvedItemIDs = CollectUnresolvedItemIDs(orderData)
 	orderData.hasUnresolvedItemData = OrderHasUnresolvedItemData(orderData)
 
 	return orderData
@@ -2006,7 +2019,9 @@ end
 
 function Pane:MarkDetailWarningDirty()
 	self.detailWarningDataDirty = true
-	self:ScheduleDetailWarningUpdate(DETAIL_WARNING_UPDATE_DELAY)
+	if self:IsDetailWarningVisible() then
+		self:ScheduleDetailWarningUpdate(DETAIL_WARNING_UPDATE_DELAY)
+	end
 end
 
 function Pane:ScheduleDetailWarningUpdate(delay)
@@ -2017,8 +2032,15 @@ function Pane:ScheduleDetailWarningUpdate(delay)
 	self.detailWarningTimerQueued = true
 	C_Timer.After(delay or 0, function()
 		Pane.detailWarningTimerQueued = nil
-		Pane:UpdateDetailExpensiveWarning()
+		if Pane and Pane:IsDetailWarningVisible() then
+			Pane:UpdateDetailExpensiveWarning()
+		end
 	end)
+end
+
+function Pane:IsDetailWarningVisible()
+	local _, _, schematicForm = self:GetCurrentOrderViewContext()
+	return not not (schematicForm and schematicForm:IsShown())
 end
 
 function Pane:EnsureDetailWarningHooks()
@@ -3747,6 +3769,7 @@ function Pane:ClearVisibleOrders(profession)
 	self.ordersGeneration = self.rebuildGeneration or 0
 	self.selectedOrderIDs = {}
 	self.hasUnresolvedItemData = false
+	self.unresolvedItemIDs = {}
 	self:HideAllRows()
 end
 
@@ -3772,6 +3795,7 @@ end
 function Pane:BeginVisibleSession()
 	self.visibleSessionId = (self.visibleSessionId or 0) + 1
 	self.requestSettleUntil = nil
+	self.requestReadinessRetryCount = 0
 	self:SetVisibleProfession(self:GetCurrentProfessionID())
 end
 
@@ -3805,6 +3829,18 @@ function Pane:SchedulePendingRefresh(reason, delay)
 
 	self:ChoosePendingReason(reason)
 	self:UpdateEmptyState()
+end
+
+function Pane:ScheduleRequestReadinessRetry(reason)
+	if (self.requestReadinessRetryCount or 0) >= REQUEST_READINESS_RETRY_LIMIT then
+		self:UpdateEmptyState()
+		return false
+	end
+
+	self.requestReadinessRetryCount = (self.requestReadinessRetryCount or 0) + 1
+	self:SchedulePendingRefresh(reason or "show", REQUEST_READINESS_RETRY_DELAY)
+	self:UpdateEmptyState()
+	return true
 end
 
 function Pane:ShouldQueueOpenRequest(profession)
@@ -3860,7 +3896,7 @@ function Pane:MarkDirty(reason)
 	if reason == "sort" then
 		self.needsRender = true
 	elseif reason == "show" or reason == "order-type" or reason == "can-request" or reason == "request-timeout" then
-		if self:ShouldQueueOpenRequest(currentProfession) then
+		if currentProfession == nil or self:ShouldQueueOpenRequest(currentProfession) then
 			self.needsRequest = true
 		end
 		if self:NeedsPreparedOrderRebuild(currentProfession) then
@@ -3873,7 +3909,7 @@ function Pane:MarkDirty(reason)
 			self.needsRebuild = true
 		end
 	elseif reason == "trade-skill-source" then
-		if professionChanged or not self:HasSuccessfulRequestForVisibleSession(currentProfession) then
+		if professionChanged or currentProfession == nil or not self:HasSuccessfulRequestForVisibleSession(currentProfession) then
 			self.needsRequest = true
 		else
 			self.needsRebuild = true
@@ -3937,6 +3973,7 @@ function Pane:RequestOrders(reason, profession)
 	local requestID = (self.requestSerial or 0) + 1
 	local requestSessionId = self.visibleSessionId
 	self.requestSerial = requestID
+	self.requestReadinessRetryCount = 0
 	self.requesting = true
 	self.activeRequestID = requestID
 	self.activeRequestProfession = profession
@@ -4006,11 +4043,15 @@ function Pane:MaybeRequestOrders(reason)
 		return false
 	end
 
-	if not profession
-		or type(C_TradeSkillUI) ~= "table"
+	if not profession then
+		self:ScheduleRequestReadinessRetry(reason)
+		return false
+	end
+
+	if type(C_TradeSkillUI) ~= "table"
 		or type(C_TradeSkillUI.IsNearProfessionSpellFocus) ~= "function"
 		or not C_TradeSkillUI.IsNearProfessionSpellFocus(profession) then
-		self:UpdateEmptyState()
+		self:ScheduleRequestReadinessRetry(reason)
 		return false
 	end
 
@@ -4028,14 +4069,18 @@ function Pane:RebuildPreparedOrders()
 
 	if preserveVisibleCache then
 		local hasUnresolvedItemData = false
+		local unresolvedItemIDs = {}
 		for _, order in ipairs(self.orders or EMPTY_LIST) do
 			if order.hasUnresolvedItemData then
 				hasUnresolvedItemData = true
-				break
+				for itemID in pairs(order.unresolvedItemIDs or EMPTY_LIST) do
+					unresolvedItemIDs[itemID] = true
+				end
 			end
 		end
 
 		self.hasUnresolvedItemData = hasUnresolvedItemData
+		self.unresolvedItemIDs = unresolvedItemIDs
 		self.ordersProfession = currentProfession
 		return false
 	end
@@ -4043,6 +4088,7 @@ function Pane:RebuildPreparedOrders()
 	local preparedOrders = {}
 	local preparedOrderCache = {}
 	local hasUnresolvedItemData = false
+	local unresolvedItemIDs = {}
 
 	for _, rawOrder in ipairs(rawOrders) do
 		local fingerprint = BuildOrderFingerprint(rawOrder)
@@ -4061,6 +4107,9 @@ function Pane:RebuildPreparedOrders()
 
 		if orderData then
 			preparedOrders[#preparedOrders + 1] = orderData
+			for itemID in pairs(orderData.unresolvedItemIDs or EMPTY_LIST) do
+				unresolvedItemIDs[itemID] = true
+			end
 			preparedOrderCache[rawOrder.orderID] = {
 				fingerprint = fingerprint,
 				generation = self.rebuildGeneration,
@@ -4075,6 +4124,7 @@ function Pane:RebuildPreparedOrders()
 	self.ordersProfession = currentProfession
 	self.ordersGeneration = self.rebuildGeneration
 	self.hasUnresolvedItemData = hasUnresolvedItemData
+	self.unresolvedItemIDs = unresolvedItemIDs
 	self:PruneSelectedOrders()
 	return true
 end
@@ -4126,6 +4176,7 @@ function Pane:SetCustomPaneShown(isShown)
 		self.needsRebuild = false
 		self.needsRender = false
 		self.requestSettleUntil = nil
+		self.requestReadinessRetryCount = 0
 		self.trailingDirtyTokens = nil
 	end
 
@@ -4309,8 +4360,12 @@ function Pane:InitializeEvents()
 		Pane:MarkDirty("rewards")
 	end)
 
-	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function()
-		if Pane.root and Pane.root:IsShown() and Pane.hasUnresolvedItemData then
+	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function(_, itemID)
+		if Pane.root
+			and Pane.root:IsShown()
+			and type(itemID) == "number"
+			and Pane.unresolvedItemIDs
+			and Pane.unresolvedItemIDs[itemID] then
 			Pane:ScheduleTrailingDirty("item-data", ITEM_DATA_REFRESH_DELAY)
 		end
 		Pane:MarkDetailWarningDirty()
