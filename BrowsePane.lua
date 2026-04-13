@@ -48,10 +48,11 @@ local CREATE_LIST_BUTTON_WIDTH = 22
 local CREATE_LIST_BUTTON_HEIGHT = 18
 local CREATE_LIST_BUTTON_LEFT_OFFSET = 4
 local CREATE_LIST_BUTTON_TOP_OFFSET = 19
-local MIN_REFRESH_INTERVAL = 0.15
 local REQUEST_COOLDOWN = 0.75
 local REQUEST_TIMEOUT = 12
-local ITEM_DATA_REFRESH_DELAY = 0.4
+local REQUEST_SETTLE_DELAY = 0.25
+local ITEM_DATA_REFRESH_DELAY = 0.75
+local INITIALIZE_RETRY_DELAY = 0.1
 local DONT_BUY_OVERLAY_TEXTURE = "Interface\\RaidFrame\\ReadyCheck-NotReady"
 local DETAIL_WARNING_ICON_TEXTURE = "Interface\\DialogFrame\\UI-Dialog-Icon-AlertNew"
 local DETAIL_WARNING_UPDATE_DELAY = 0.05
@@ -129,10 +130,16 @@ Pane.sortAscending = false
 Pane.rows = {}
 Pane.orders = {}
 Pane.selectedOrderIDs = {}
+Pane.preparedOrderCache = {}
+Pane.rebuildGeneration = 0
+Pane.ordersGeneration = 0
+Pane.hasUnresolvedItemData = false
+Pane.needsRequest = false
+Pane.needsRebuild = false
+Pane.needsRender = false
 Pane.pendingReason = nil
-Pane.pendingRequest = false
-Pane.nextRefreshAt = nil
-Pane.lastRefreshAt = 0
+Pane.pendingDueAt = nil
+Pane.visibleSessionId = 0
 
 local function FormatCount(count, alwaysShow)
 	if count and (count > 1 or (alwaysShow and count > 0)) then
@@ -256,7 +263,7 @@ function Pane:ToggleDontBuyItem(itemID)
 	local isIgnored = not self:IsDontBuyItem(itemID)
 	self:SetDontBuyItem(itemID, isIgnored)
 	if self.root and self.root:IsShown() then
-		self:RefreshRows()
+		self:RenderRows()
 	end
 	return isIgnored
 end
@@ -466,12 +473,14 @@ local function GetRefreshDelay(reason)
 		return 0.01
 	elseif reason == "sort" then
 		return 0
-	elseif reason == "pricing-db" or reason == "trade-skill-source" or reason == "config" then
+	elseif reason == "pricing-db" or reason == "trade-skill-source" or (type(reason) == "string" and reason:match("^config:")) then
 		return 0.1
+	elseif reason == "request-success" then
+		return REQUEST_SETTLE_DELAY
 	elseif reason == "order-count" or reason == "rewards" or reason == "can-request" or reason == "request-timeout" then
 		return 0.15
-	elseif reason == "customer-name" then
-		return 0.25
+	elseif reason == "item-data" then
+		return ITEM_DATA_REFRESH_DELAY
 	end
 
 	return 0.05
@@ -1869,6 +1878,97 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 	orderData.qualityRequirement = CompactQualityRequirement(orderData.qualityRequirement)
 end
 
+local function AppendFingerprintParts(parts, ...)
+	for index = 1, select("#", ...) do
+		local value = select(index, ...)
+		parts[#parts + 1] = tostring(value == nil and "" or value)
+	end
+end
+
+local function AppendRewardFingerprint(parts, rewards)
+	for _, reward in ipairs(rewards or EMPTY_LIST) do
+		AppendFingerprintParts(
+			parts,
+			reward.itemLink or reward.itemID or "",
+			reward.currencyType or "",
+			reward.count or reward.quantity or 1
+		)
+	end
+end
+
+local function AppendSuppliedReagentFingerprint(parts, suppliedReagents)
+	for _, suppliedReagent in ipairs(suppliedReagents or EMPTY_LIST) do
+		local reagentInfo = suppliedReagent.reagentInfo or {}
+		AppendFingerprintParts(
+			parts,
+			suppliedReagent.slotIndex or "",
+			reagentInfo.itemID or "",
+			reagentInfo.itemLink or "",
+			reagentInfo.currencyID or "",
+			reagentInfo.quality or "",
+			reagentInfo.quantity or suppliedReagent.quantity or 0
+		)
+	end
+end
+
+local function BuildOrderFingerprint(rawOrder)
+	local parts = {}
+	AppendFingerprintParts(
+		parts,
+		rawOrder and rawOrder.orderID or "",
+		rawOrder and rawOrder.expirationTime or "",
+		rawOrder and rawOrder.customerName or "",
+		rawOrder and rawOrder.skillLineAbilityID or "",
+		rawOrder and rawOrder.minQuality or "",
+		rawOrder and rawOrder.tipAmount or "",
+		rawOrder and rawOrder.consortiumCut or ""
+	)
+	AppendRewardFingerprint(parts, rawOrder and rawOrder.npcOrderRewards)
+	AppendSuppliedReagentFingerprint(parts, rawOrder and rawOrder.reagents)
+	return table.concat(parts, "|")
+end
+
+local function IsItemDataPending(itemID)
+	if type(itemID) ~= "number" or itemID <= 0 then
+		return false
+	end
+
+	if C_Item and type(C_Item.IsItemDataCachedByID) == "function" then
+		local ok, isCached = pcall(C_Item.IsItemDataCachedByID, itemID)
+		if ok then
+			return not isCached
+		end
+	end
+
+	return Util.GetItemName(itemID) == nil
+end
+
+local function OrderHasUnresolvedItemData(orderData)
+	if not orderData then
+		return false
+	end
+
+	if IsItemDataPending(orderData.product and orderData.product.itemID) then
+		return true
+	end
+
+	for _, rewardIcon in ipairs((orderData.reward and orderData.reward.icons) or EMPTY_LIST) do
+		if IsItemDataPending(rewardIcon.itemID) then
+			return true
+		end
+	end
+
+	for _, slotData in ipairs(orderData.requiredReagents or EMPTY_LIST) do
+		for _, option in ipairs(slotData.options or EMPTY_LIST) do
+			if IsItemDataPending(option.itemID) then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
 local function PrepareOrder(rawOrder)
 	local recipeInfo = GetRecipeInfo(rawOrder)
 	local recipeSchematic = recipeInfo and GetRecipeSchematic(recipeInfo)
@@ -1899,6 +1999,7 @@ local function PrepareOrder(rawOrder)
 
 	BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedReagents)
 	orderData.profitValue, orderData.profitKnown, orderData.profitComplete = EvaluateProfit(orderData)
+	orderData.hasUnresolvedItemData = OrderHasUnresolvedItemData(orderData)
 
 	return orderData
 end
@@ -3277,7 +3378,7 @@ function Pane:BuildFrame()
 				Pane.sortKey = button.sortKey
 				Pane.sortAscending = mouseButton == "RightButton"
 			end
-			Pane:Refresh("sort")
+			Pane:MarkDirty("sort")
 		end)
 	end
 
@@ -3298,18 +3399,15 @@ function Pane:BuildFrame()
 
 	root:SetScript("OnShow", function()
 		Pane:ApplyReferenceLayout()
+		Pane:BeginVisibleSession()
 		Pane:MarkDirty("show")
 	end)
 	root:SetScript("OnUpdate", function(_, elapsed)
 		Pane.elapsedSinceTick = (Pane.elapsedSinceTick or 0) + elapsed
 
-		if Pane.pendingReason and Pane.nextRefreshAt and GetTime() >= Pane.nextRefreshAt then
-			local reason = Pane.pendingReason
-			local shouldRequest = Pane.pendingRequest
-			Pane.pendingReason = nil
-			Pane.pendingRequest = false
-			Pane.nextRefreshAt = nil
-			Pane:Refresh(reason, shouldRequest)
+		if Pane.pendingDueAt and GetTime() >= Pane.pendingDueAt then
+			Pane.pendingDueAt = nil
+			Pane:ProcessPendingRefresh()
 		end
 
 		if Pane.root:IsShown() and Pane.elapsedSinceTick > 30 then
@@ -3331,19 +3429,15 @@ function Pane:BuildFrame()
 	return true
 end
 
-function Pane:PrepareOrders()
-	local prepared = {}
-	for _, rawOrder in ipairs(C_CraftingOrders.GetCrafterOrders() or {}) do
+function Pane:GetVisibleRawOrders()
+	local rawOrders = {}
+	for _, rawOrder in ipairs(C_CraftingOrders.GetCrafterOrders() or EMPTY_LIST) do
 		if rawOrder.orderType == ns.ORDER_TYPE_NPC then
-			local orderData = PrepareOrder(rawOrder)
-			if orderData then
-				prepared[#prepared + 1] = orderData
-			end
+			rawOrders[#rawOrders + 1] = rawOrder
 		end
 	end
 
-	SortOrders(prepared, self.sortKey, self.sortAscending)
-	return prepared
+	return rawOrders
 end
 
 function Pane:GetCurrentProfessionID()
@@ -3419,7 +3513,11 @@ function Pane:GetFlagText(order)
 	return table.concat(parts, "  ")
 end
 
-function Pane:RefreshRows()
+function Pane:SortPreparedOrders()
+	SortOrders(self.orders, self.sortKey, self.sortAscending)
+end
+
+function Pane:RenderRows()
 	self:EnsureRowCount(#self.orders)
 
 	for index, row in ipairs(self.rows) do
@@ -3573,18 +3671,156 @@ function Pane:UpdateTimeLabels()
 	end
 end
 
-function Pane:ShouldRequestOrders(reason)
-	return reason == "show"
-		or reason == "order-type"
-		or reason == "can-request"
-		or reason == "request-timeout"
+local function GetConfigKeyFromReason(reason)
+	return type(reason) == "string" and reason:match("^config:(.+)$") or nil
+end
+
+local function DoesReasonBumpGeneration(reason)
+	local configKey = GetConfigKeyFromReason(reason)
+	return reason == "pricing-db"
 		or reason == "trade-skill-source"
+		or configKey == "pricingSource"
+end
+
+local function IsRenderOnlyConfigKey(configKey)
+	return configKey == "greyUnknownRecipes"
+		or configKey == "showSilverCopperInList"
+		or configKey == "dontBuyPerCharacter"
+end
+
+local function GetReasonPriority(reason)
+	if reason == "show" or reason == "order-type" or reason == "can-request" or reason == "request-timeout" or reason == "request-success" then
+		return 3
+	end
+	if reason == "pricing-db" or reason == "trade-skill-source" or reason == "order-count" or reason == "rewards" or reason == "item-data" then
+		return 2
+	end
+	if GetConfigKeyFromReason(reason) then
+		return 2
+	end
+	if reason == "sort" then
+		return 1
+	end
+	return 0
+end
+
+function Pane:HasVisibleOrdersForProfession(profession)
+	return profession ~= nil
+		and self.ordersProfession == profession
+		and #(self.orders or EMPTY_LIST) > 0
+end
+
+function Pane:HasSuccessfulRequestForVisibleSession(profession)
+	local requestInfo = self.lastSuccessfulRequest
+	return requestInfo ~= nil
+		and requestInfo.visibleSessionId == self.visibleSessionId
+		and requestInfo.profession == profession
+end
+
+function Pane:HasTimedOutRequestForVisibleSession(profession)
+	local requestInfo = self.lastTimedOutRequest
+	return requestInfo ~= nil
+		and requestInfo.visibleSessionId == self.visibleSessionId
+		and requestInfo.profession == profession
+end
+
+function Pane:NeedsPreparedOrderRebuild(profession)
+	return profession ~= nil
+		and self.ordersProfession == profession
+		and (self.ordersGeneration or 0) ~= (self.rebuildGeneration or 0)
+end
+
+function Pane:PruneSelectedOrders()
+	local validSelection = {}
+	for _, order in ipairs(self.orders or EMPTY_LIST) do
+		if self.selectedOrderIDs[order.orderID] then
+			validSelection[order.orderID] = true
+		end
+	end
+
+	self.selectedOrderIDs = validSelection
+end
+
+function Pane:ClearVisibleOrders(profession)
+	self.orders = {}
+	self.ordersProfession = profession
+	self.ordersGeneration = self.rebuildGeneration or 0
+	self.selectedOrderIDs = {}
+	self.hasUnresolvedItemData = false
+	self:HideAllRows()
+end
+
+function Pane:SetVisibleProfession(profession)
+	local changed = self.visibleProfession ~= profession
+	if changed then
+		self.visibleProfession = profession
+	end
+
+	if self.requesting
+		and self.activeRequestProfession
+		and self.activeRequestProfession ~= profession then
+		self:ClearRequestState()
+	end
+
+	if changed and self.root and self.root:IsShown() and self.ordersProfession ~= profession then
+		self:ClearVisibleOrders(profession)
+	end
+
+	return changed
+end
+
+function Pane:BeginVisibleSession()
+	self.visibleSessionId = (self.visibleSessionId or 0) + 1
+	self.requestSettleUntil = nil
+	self:SetVisibleProfession(self:GetCurrentProfessionID())
+end
+
+function Pane:BumpPreparedOrderGeneration()
+	self.rebuildGeneration = (self.rebuildGeneration or 0) + 1
+end
+
+function Pane:ChoosePendingReason(reason)
+	if not reason then
+		return
+	end
+
+	if not self.pendingReason or GetReasonPriority(reason) >= GetReasonPriority(self.pendingReason) then
+		self.pendingReason = reason
+	end
+end
+
+function Pane:SchedulePendingRefresh(reason, delay)
+	if not (self.root and self.root:IsShown()) then
+		return
+	end
+
+	local dueAt = GetTime() + (delay or GetRefreshDelay(reason))
+	if self.needsRebuild and self.requestSettleUntil then
+		dueAt = math.max(dueAt, self.requestSettleUntil)
+	end
+
+	if not self.pendingDueAt or dueAt < self.pendingDueAt then
+		self.pendingDueAt = dueAt
+	end
+
+	self:ChoosePendingReason(reason)
+	self:UpdateEmptyState()
+end
+
+function Pane:ShouldQueueOpenRequest(profession)
+	if not profession then
+		return false
+	end
+
+	return self.ordersProfession ~= profession
+		or not self:HasVisibleOrdersForProfession(profession)
+		or not self:HasSuccessfulRequestForVisibleSession(profession)
+		or self:HasTimedOutRequestForVisibleSession(profession)
 end
 
 function Pane:IsLoadingOrders()
 	return not not self.requesting
-		or not not self.pendingRequest
-		or (self.pendingReason ~= nil and self:ShouldRequestOrders(self.pendingReason))
+		or not not self.needsRequest
 end
 
 function Pane:UpdateEmptyState()
@@ -3605,96 +3841,58 @@ function Pane:UpdateEmptyState()
 	self.noOrders:SetShown(not hasOrders)
 end
 
-function Pane:Refresh(reason, shouldRequest)
-	if not (self.root and self.root:IsShown()) then
-		return
-	end
-
-	self.lastRefreshAt = GetTime()
-	local currentProfession = self:GetCurrentProfessionID()
-	if self.requesting
-		and self.activeRequestProfession
-		and currentProfession
-		and self.activeRequestProfession ~= currentProfession then
-		self:ClearRequestState()
-	end
-
-	if shouldRequest then
-		self:RequestOrders(reason)
-	end
-	local preparedOrders = self:PrepareOrders()
-	local preserveVisibleCache = #preparedOrders == 0
-		and #(self.orders or {}) > 0
-		and currentProfession ~= nil
-		and self.ordersProfession == currentProfession
-		and self:IsLoadingOrders()
-
-	if preserveVisibleCache then
-		self:UpdateEmptyState()
-		self:UpdateToolbar()
-		return
-	end
-
-	self.orders = preparedOrders
-	self.ordersProfession = currentProfession
-
-	local validSelection = {}
-	for _, order in ipairs(self.orders) do
-		if self.selectedOrderIDs[order.orderID] then
-			validSelection[order.orderID] = true
-		end
-	end
-	self.selectedOrderIDs = validSelection
-	self:RefreshRows()
-end
-
 function Pane:MarkDirty(reason)
-	if not self.root or not self.root:IsShown() then
-		return
+	reason = reason or "update"
+
+	local isVisible = self.root and self.root:IsShown()
+	local currentProfession = isVisible and self:GetCurrentProfessionID() or self.visibleProfession
+	local professionChanged = false
+	local configKey = GetConfigKeyFromReason(reason)
+
+	if DoesReasonBumpGeneration(reason) or (reason == "item-data" and self.hasUnresolvedItemData) then
+		self:BumpPreparedOrderGeneration()
 	end
 
-	local now = GetTime()
-	local dueAt = math.max(now + GetRefreshDelay(reason), (self.lastRefreshAt or 0) + MIN_REFRESH_INTERVAL)
-	self.pendingRequest = self.pendingRequest or self:ShouldRequestOrders(reason)
-
-	if not self.pendingReason then
-		self.pendingReason = reason or "update"
-		self.nextRefreshAt = dueAt
-		self:UpdateEmptyState()
-		return
+	if isVisible then
+		professionChanged = self:SetVisibleProfession(currentProfession)
 	end
 
-	if self:ShouldRequestOrders(reason) and not self:ShouldRequestOrders(self.pendingReason) then
-		self.pendingReason = reason
-	elseif dueAt < (self.nextRefreshAt or math.huge) then
-		self.pendingReason = reason or self.pendingReason
-	end
-
-	self.nextRefreshAt = math.min(self.nextRefreshAt or dueAt, dueAt)
-	self:UpdateEmptyState()
-end
-
-function Pane:QueueDeferredDirty(reason, delay)
-	if not self.root or not self.root:IsShown() then
-		return
-	end
-
-	self.deferredDirty = self.deferredDirty or {}
-	self.deferredTimers = self.deferredTimers or {}
-	self.deferredDirty[reason] = true
-
-	if self.deferredTimers[reason] then
-		return
-	end
-
-	self.deferredTimers[reason] = true
-	C_Timer.After(delay or 0.1, function()
-		Pane.deferredTimers[reason] = nil
-		if Pane.deferredDirty and Pane.deferredDirty[reason] then
-			Pane.deferredDirty[reason] = nil
-			Pane:MarkDirty(reason)
+	if reason == "sort" then
+		self.needsRender = true
+	elseif reason == "show" or reason == "order-type" or reason == "can-request" or reason == "request-timeout" then
+		if self:ShouldQueueOpenRequest(currentProfession) then
+			self.needsRequest = true
 		end
-	end)
+		if self:NeedsPreparedOrderRebuild(currentProfession) then
+			self.needsRebuild = true
+		end
+	elseif reason == "request-success" or reason == "order-count" or reason == "rewards" or reason == "pricing-db" then
+		self.needsRebuild = true
+	elseif reason == "item-data" then
+		if self.hasUnresolvedItemData then
+			self.needsRebuild = true
+		end
+	elseif reason == "trade-skill-source" then
+		if professionChanged or not self:HasSuccessfulRequestForVisibleSession(currentProfession) then
+			self.needsRequest = true
+		else
+			self.needsRebuild = true
+		end
+	elseif configKey == "pricingSource" then
+		self.needsRebuild = true
+	elseif IsRenderOnlyConfigKey(configKey) then
+		self.needsRender = true
+	end
+
+	if not isVisible then
+		return
+	end
+
+	if self.needsRequest or self.needsRebuild or self.needsRender then
+		self:SchedulePendingRefresh(reason, GetRefreshDelay(reason))
+	else
+		self:UpdateEmptyState()
+	end
 end
 
 function Pane:ClearRequestState(requestID)
@@ -3705,6 +3903,7 @@ function Pane:ClearRequestState(requestID)
 	self.requesting = false
 	self.activeRequestID = nil
 	self.activeRequestProfession = nil
+	self.activeRequestSessionId = nil
 	self.activeRequestReason = nil
 	self:UpdateEmptyState()
 	return true
@@ -3716,8 +3915,16 @@ function Pane:StartRequestTimeout(requestID)
 			return
 		end
 
-		local professionMatches = Pane.activeRequestProfession ~= nil
-			and Pane.activeRequestProfession == Pane:GetCurrentProfessionID()
+		local timedOutProfession = Pane.activeRequestProfession
+		local timedOutSessionId = Pane.activeRequestSessionId
+		local professionMatches = timedOutProfession ~= nil
+			and timedOutProfession == Pane:GetCurrentProfessionID()
+		if timedOutProfession and timedOutSessionId then
+			Pane.lastTimedOutRequest = {
+				visibleSessionId = timedOutSessionId,
+				profession = timedOutProfession,
+			}
+		end
 		Pane:ClearRequestState(requestID)
 		if professionMatches and Pane.root and Pane.root:IsShown() then
 			Pane:MarkDirty("request-timeout")
@@ -3725,26 +3932,15 @@ function Pane:StartRequestTimeout(requestID)
 	end)
 end
 
-function Pane:RequestOrders(reason)
-	if self.requesting then
-		return
-	end
-
+function Pane:RequestOrders(reason, profession)
 	local now = GetTime()
-	if self.lastRequestAt and (now - self.lastRequestAt) < REQUEST_COOLDOWN then
-		return
-	end
-
-	local profession = self:GetCurrentProfessionID()
-	if not profession or not C_TradeSkillUI.IsNearProfessionSpellFocus(profession) then
-		return
-	end
-
 	local requestID = (self.requestSerial or 0) + 1
+	local requestSessionId = self.visibleSessionId
 	self.requestSerial = requestID
 	self.requesting = true
 	self.activeRequestID = requestID
 	self.activeRequestProfession = profession
+	self.activeRequestSessionId = requestSessionId
 	self.activeRequestReason = reason
 	self:UpdateEmptyState()
 	self.lastRequestAt = now
@@ -3761,6 +3957,7 @@ function Pane:RequestOrders(reason)
 		callback = function(result, orderType)
 			local currentProfession = self:GetCurrentProfessionID()
 			local isActiveRequest = self.activeRequestID == requestID
+			local isCurrentSession = requestSessionId == self.visibleSessionId
 			if isActiveRequest then
 				self:ClearRequestState(requestID)
 			end
@@ -3770,10 +3967,148 @@ function Pane:RequestOrders(reason)
 				and profession == currentProfession
 				and self.root
 				and self.root:IsShown() then
-				self:MarkDirty("request-" .. tostring(reason or "sync"))
+				if isCurrentSession then
+					self.lastSuccessfulRequest = {
+						visibleSessionId = requestSessionId,
+						profession = profession,
+					}
+					if self:HasTimedOutRequestForVisibleSession(profession) then
+						self.lastTimedOutRequest = nil
+					end
+				end
+
+				self.requestSettleUntil = GetTime() + REQUEST_SETTLE_DELAY
+				self:MarkDirty("request-success")
 			end
 		end,
 	})
+end
+
+function Pane:MaybeRequestOrders(reason)
+	if not self.needsRequest then
+		return false
+	end
+
+	local profession = self:GetCurrentProfessionID()
+	if self.requesting then
+		if self.activeRequestProfession == profession then
+			self.needsRequest = false
+		else
+			self:ClearRequestState()
+		end
+		return false
+	end
+
+	local now = GetTime()
+	if self.lastRequestAt and (now - self.lastRequestAt) < REQUEST_COOLDOWN then
+		self:SchedulePendingRefresh(reason or "request-cooldown", (self.lastRequestAt + REQUEST_COOLDOWN) - now)
+		self:UpdateEmptyState()
+		return false
+	end
+
+	if not profession
+		or type(C_TradeSkillUI) ~= "table"
+		or type(C_TradeSkillUI.IsNearProfessionSpellFocus) ~= "function"
+		or not C_TradeSkillUI.IsNearProfessionSpellFocus(profession) then
+		self:UpdateEmptyState()
+		return false
+	end
+
+	self.needsRequest = false
+	self:RequestOrders(reason, profession)
+	return true
+end
+
+function Pane:RebuildPreparedOrders()
+	local currentProfession = self:GetCurrentProfessionID()
+	local rawOrders = self:GetVisibleRawOrders()
+	local preserveVisibleCache = #rawOrders == 0
+		and self:HasVisibleOrdersForProfession(currentProfession)
+		and self:IsLoadingOrders()
+
+	if preserveVisibleCache then
+		local hasUnresolvedItemData = false
+		for _, order in ipairs(self.orders or EMPTY_LIST) do
+			if order.hasUnresolvedItemData then
+				hasUnresolvedItemData = true
+				break
+			end
+		end
+
+		self.hasUnresolvedItemData = hasUnresolvedItemData
+		self.ordersProfession = currentProfession
+		return false
+	end
+
+	local preparedOrders = {}
+	local preparedOrderCache = {}
+	local hasUnresolvedItemData = false
+
+	for _, rawOrder in ipairs(rawOrders) do
+		local fingerprint = BuildOrderFingerprint(rawOrder)
+		local cacheEntry = self.preparedOrderCache[rawOrder.orderID]
+		local orderData
+
+		if cacheEntry
+			and cacheEntry.fingerprint == fingerprint
+			and cacheEntry.generation == self.rebuildGeneration then
+			orderData = cacheEntry.data
+			hasUnresolvedItemData = hasUnresolvedItemData or not not cacheEntry.hasUnresolvedItemData
+		else
+			orderData = PrepareOrder(rawOrder)
+			hasUnresolvedItemData = hasUnresolvedItemData or not not (orderData and orderData.hasUnresolvedItemData)
+		end
+
+		if orderData then
+			preparedOrders[#preparedOrders + 1] = orderData
+			preparedOrderCache[rawOrder.orderID] = {
+				fingerprint = fingerprint,
+				generation = self.rebuildGeneration,
+				data = orderData,
+				hasUnresolvedItemData = orderData.hasUnresolvedItemData or false,
+			}
+		end
+	end
+
+	self.preparedOrderCache = preparedOrderCache
+	self.orders = preparedOrders
+	self.ordersProfession = currentProfession
+	self.ordersGeneration = self.rebuildGeneration
+	self.hasUnresolvedItemData = hasUnresolvedItemData
+	self:PruneSelectedOrders()
+	return true
+end
+
+function Pane:ProcessPendingRefresh()
+	if not (self.root and self.root:IsShown()) then
+		return
+	end
+
+	local reason = self.pendingReason or "update"
+	self.pendingReason = nil
+	self:SetVisibleProfession(self:GetCurrentProfessionID())
+	self:MaybeRequestOrders(reason)
+
+	if self.needsRebuild then
+		self.needsRebuild = false
+		if self:RebuildPreparedOrders() then
+			self.needsRender = true
+		end
+	end
+
+	if self.needsRender then
+		self.needsRender = false
+		self:SortPreparedOrders()
+		self:RenderRows()
+	else
+		self:UpdateEmptyState()
+		self:UpdateHeaderArrow()
+		self:UpdateToolbar()
+	end
+
+	if self.requestSettleUntil and GetTime() >= self.requestSettleUntil then
+		self.requestSettleUntil = nil
+	end
 end
 
 function Pane:SetCustomPaneShown(isShown)
@@ -3783,28 +4118,15 @@ function Pane:SetCustomPaneShown(isShown)
 
 	if isShown then
 		self:ApplyReferenceLayout()
-		local currentProfession = self:GetCurrentProfessionID()
-		if self.requesting
-			and self.activeRequestProfession
-			and currentProfession
-			and self.activeRequestProfession ~= currentProfession then
-			self:ClearRequestState()
-		end
-		local canReuseVisibleCache = currentProfession ~= nil
-			and self.ordersProfession == currentProfession
-			and #(self.orders or {}) > 0
-
-		if not canReuseVisibleCache then
-			self.orders = {}
-			self.ordersProfession = currentProfession
-			self.selectedOrderIDs = {}
-			self:HideAllRows()
-		end
 	else
 		self:ClearRequestState()
 		self.pendingReason = nil
-		self.pendingRequest = false
-		self.nextRefreshAt = nil
+		self.pendingDueAt = nil
+		self.needsRequest = false
+		self.needsRebuild = false
+		self.needsRender = false
+		self.requestSettleUntil = nil
+		self.trailingDirtyTokens = nil
 	end
 
 	if isShown then
@@ -3952,6 +4274,21 @@ function Pane:InitializeHooks()
 	return true
 end
 
+function Pane:ScheduleTrailingDirty(reason, delay)
+	self.trailingDirtyTokens = self.trailingDirtyTokens or {}
+	local token = (self.trailingDirtyTokens[reason] or 0) + 1
+	self.trailingDirtyTokens[reason] = token
+
+	C_Timer.After(delay or 0, function()
+		if not Pane or not Pane.trailingDirtyTokens or Pane.trailingDirtyTokens[reason] ~= token then
+			return
+		end
+
+		Pane.trailingDirtyTokens[reason] = nil
+		Pane:MarkDirty(reason)
+	end)
+end
+
 function Pane:InitializeEvents()
 	if self.eventsInitialized then
 		return
@@ -3960,7 +4297,7 @@ function Pane:InitializeEvents()
 	self.eventsInitialized = true
 	ns.RegisterEvent("CRAFTINGORDERS_UPDATE_ORDER_COUNT", function(_, orderType)
 		if orderType == ns.ORDER_TYPE_NPC then
-			Pane:QueueDeferredDirty("order-count", 0.1)
+			Pane:MarkDirty("order-count")
 		end
 	end)
 
@@ -3969,11 +4306,13 @@ function Pane:InitializeEvents()
 	end)
 
 	ns.RegisterEvent("CRAFTINGORDERS_UPDATE_REWARDS", function()
-		Pane:QueueDeferredDirty("rewards", 0.2)
+		Pane:MarkDirty("rewards")
 	end)
 
 	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function()
-		Pane:QueueDeferredDirty("item-data", ITEM_DATA_REFRESH_DELAY)
+		if Pane.root and Pane.root:IsShown() and Pane.hasUnresolvedItemData then
+			Pane:ScheduleTrailingDirty("item-data", ITEM_DATA_REFRESH_DELAY)
+		end
 		Pane:MarkDetailWarningDirty()
 	end)
 
@@ -3983,29 +4322,38 @@ function Pane:InitializeEvents()
 	end)
 end
 
+function Pane:ScheduleInitializeRetry()
+	if self.initializeRetryQueued then
+		return
+	end
+
+	self.initializeRetryQueued = true
+	C_Timer.After(INITIALIZE_RETRY_DELAY, function()
+		if Pane then
+			Pane.initializeRetryQueued = nil
+		end
+		if Pane and not Pane.initialized then
+			Pane:Initialize()
+		end
+	end)
+end
+
 function Pane:Initialize()
 	if self.initialized then
 		return
 	end
 
 	if not self:BuildFrame() then
-		C_Timer.After(0.1, function()
-			if Pane and not Pane.initialized then
-				Pane:Initialize()
-			end
-		end)
+		self:ScheduleInitializeRetry()
 		return
 	end
 
 	if not self:InitializeHooks() then
-		C_Timer.After(0.1, function()
-			if Pane and not Pane.initialized then
-				Pane:Initialize()
-			end
-		end)
+		self:ScheduleInitializeRetry()
 		return
 	end
 
+	self.initializeRetryQueued = nil
 	self.initialized = true
 	self:InitializeEvents()
 	self:UpdateToolbar()

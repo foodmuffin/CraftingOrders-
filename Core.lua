@@ -296,7 +296,7 @@ function ns.SetConfig(key, value)
 		ns.Options:Refresh()
 	end
 	if ns.BrowsePane and ns.BrowsePane.MarkDirty then
-		ns.BrowsePane:MarkDirty("config")
+		ns.BrowsePane:MarkDirty("config:" .. tostring(key))
 	end
 	if ns.BrowsePane and ns.BrowsePane.MarkDetailWarningDirty then
 		ns.BrowsePane:MarkDetailWarningDirty()
@@ -407,6 +407,20 @@ local function SafeInitializeModule(module)
 	end
 end
 
+local professionsModulesRetryQueued = false
+
+local function ScheduleProfessionsModulesRetry()
+	if professionsModulesRetryQueued then
+		return
+	end
+
+	professionsModulesRetryQueued = true
+	C_Timer.After(0.1, function()
+		professionsModulesRetryQueued = false
+		ns.InitializeProfessionsModules()
+	end)
+end
+
 function ns.InitializeCommonModules()
 	if type(CraftingOrdersPlusPlusDB) ~= "table" then
 		ns.InitializeDatabase()
@@ -423,11 +437,12 @@ function ns.InitializeProfessionsModules()
 
 	if not ns.IsProfessionsReady() then
 		if ns.IsAddonLoaded("Blizzard_Professions") then
-			C_Timer.After(0.1, ns.InitializeProfessionsModules)
+			ScheduleProfessionsModulesRetry()
 		end
 		return
 	end
 
+	professionsModulesRetryQueued = false
 	SafeInitializeModule(ns.BrowsePane)
 end
 
