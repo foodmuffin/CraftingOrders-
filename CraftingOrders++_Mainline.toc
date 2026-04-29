@@ -1,4 +1,4 @@
-## Interface: 120001
+## Interface: 120005
 ## Title: Crafting Orders++
 ## Author: @project-author@
 ## Version: @project-version@
