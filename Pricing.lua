@@ -39,6 +39,39 @@ local providers = {
 	},
 }
 
+local function NormalizeUnitPrice(value)
+	if type(value) ~= "number" or value ~= value or value <= 0 then
+		return nil
+	end
+
+	return value
+end
+
+local function ExtractItemID(item)
+	if type(item) == "number" and item > 0 then
+		return item
+	end
+
+	if type(item) == "string" then
+		return tonumber(item:match("item:(%d+)"))
+	end
+
+	return nil
+end
+
+local function GetMarketableState(item)
+	if not (Util and type(Util.IsItemMarketable) == "function") then
+		return nil
+	end
+
+	local ok, isMarketable = pcall(Util.IsItemMarketable, item)
+	if ok then
+		return isMarketable
+	end
+
+	return nil
+end
+
 local function BuildShoppingSummary(entries)
 	local summary = {
 		entryCount = 0,
@@ -48,12 +81,13 @@ local function BuildShoppingSummary(entries)
 	}
 
 	for _, entry in ipairs(entries or {}) do
-		local quantity = math.max(0, entry and entry.quantity or 0)
+		local quantity = math.max(0, tonumber(entry and entry.quantity) or 0)
 		if quantity > 0 then
 			summary.entryCount = summary.entryCount + 1
 			summary.totalQuantity = summary.totalQuantity + quantity
-			if type(entry.unitPrice) == "number" and entry.unitPrice > 0 then
-				summary.estimatedCost = summary.estimatedCost + (entry.unitPrice * quantity)
+			local unitPrice = NormalizeUnitPrice(entry and entry.unitPrice)
+			if unitPrice then
+				summary.estimatedCost = summary.estimatedCost + (unitPrice * quantity)
 				summary.pricedEntryCount = summary.pricedEntryCount + 1
 			end
 		end
@@ -98,8 +132,8 @@ local function GetShoppingEntryTier(entry)
 end
 
 local function BuildPriceInfo(item, count, providerKey, state, unitPrice, isMarketable)
-	local quantity = math.max(1, count or 1)
-	local hasPrice = type(unitPrice) == "number" and unitPrice > 0
+	local quantity = math.max(1, tonumber(count) or 1)
+	unitPrice = NormalizeUnitPrice(unitPrice)
 
 	return {
 		item = item,
@@ -107,8 +141,8 @@ local function BuildPriceInfo(item, count, providerKey, state, unitPrice, isMark
 		providerKey = providerKey,
 		state = state,
 		isMarketable = isMarketable,
-		unitPrice = hasPrice and unitPrice or nil,
-		totalPrice = hasPrice and (unitPrice * quantity) or nil,
+		unitPrice = unitPrice,
+		totalPrice = unitPrice and (unitPrice * quantity) or nil,
 	}
 end
 
@@ -118,18 +152,27 @@ local function GetAuctionatorPrice(item)
 		return nil
 	end
 
-	if type(item) == "number" then
+	if type(item) == "number" and type(api.GetAuctionPriceByItemID) == "function" then
 		local ok, value = pcall(api.GetAuctionPriceByItemID, ns.CALLER_ID, item)
-		return ok and value or nil
+		return NormalizeUnitPrice(ok and value or nil)
 	end
 
 	local link = Util.GetItemLink(item)
-	if not link then
-		return nil
+	if link and type(api.GetAuctionPriceByItemLink) == "function" then
+		local ok, value = pcall(api.GetAuctionPriceByItemLink, ns.CALLER_ID, link)
+		value = NormalizeUnitPrice(ok and value or nil)
+		if value then
+			return value
+		end
 	end
 
-	local ok, value = pcall(api.GetAuctionPriceByItemLink, ns.CALLER_ID, link)
-	return ok and value or nil
+	local itemID = ExtractItemID(item or link)
+	if itemID and type(api.GetAuctionPriceByItemID) == "function" then
+		local ok, value = pcall(api.GetAuctionPriceByItemID, ns.CALLER_ID, itemID)
+		return NormalizeUnitPrice(ok and value or nil)
+	end
+
+	return nil
 end
 
 local function GetAuctioneerPrice(item)
@@ -143,7 +186,7 @@ local function GetAuctioneerPrice(item)
 	end
 
 	local ok, value = pcall(AucAdvanced.API.GetMarketValue, link)
-	return ok and value or nil
+	return NormalizeUnitPrice(ok and value or nil)
 end
 
 function Pricing:RefreshProviders()
@@ -245,7 +288,7 @@ end
 function Pricing:GetPriceInfo(item, count)
 	local provider = self:GetActiveProvider()
 	local providerKey = provider and provider.key or nil
-	local isMarketable = Util.IsItemMarketable(item)
+	local isMarketable = GetMarketableState(item)
 
 	if isMarketable == false then
 		return BuildPriceInfo(item, count, providerKey, "not_marketable", nil, false)
@@ -258,11 +301,13 @@ function Pricing:GetPriceInfo(item, count)
 	local unitPrice
 	if provider.key == "auctionator" then
 		unitPrice = GetAuctionatorPrice(item)
-	else
+	elseif provider.key == "auctioneer" then
 		unitPrice = GetAuctioneerPrice(item)
+	else
+		return BuildPriceInfo(item, count, nil, "no_provider", nil, isMarketable)
 	end
 
-	if unitPrice and unitPrice > 0 then
+	if unitPrice then
 		return BuildPriceInfo(item, count, provider.key, "priced", unitPrice, isMarketable)
 	end
 
@@ -339,7 +384,7 @@ function Pricing:CreateAuctioneerSnatchList(entries)
 		local itemIdentity = (type(entry.itemLink) == "string" and entry.itemLink:find("item:") and entry.itemLink) or refreshedLink or entry.itemIdentity or entry.itemID
 		local priceInfo = self:GetPriceInfo(itemIdentity, 1)
 		local link = Util.GetItemLink(itemIdentity)
-		local limit = entry.unitPrice or priceInfo.unitPrice
+		local limit = NormalizeUnitPrice(entry.unitPrice) or priceInfo.unitPrice
 		if priceInfo.isMarketable ~= false and link and limit and limit > 0 then
 			local ok = pcall(snatch.AddSnatch, link, math.floor(limit))
 			if ok then
