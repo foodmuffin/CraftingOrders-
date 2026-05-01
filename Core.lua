@@ -3,7 +3,7 @@ local addonName, ns = ...
 ns.ADDON_NAME = addonName
 ns.CALLER_ID = addonName
 ns.ORDER_TYPE_NPC = Enum.CraftingOrderType and Enum.CraftingOrderType.Npc or 3
-ns.DEFAULT_SORT_KEY = "reward"
+ns.DEFAULT_SORT_KEY = "profit"
 
 local eventFrame = CreateFrame("Frame")
 local eventCallbacks = {}
@@ -24,6 +24,10 @@ local defaults = {
 	greyUnknownRecipes = true,
 	showRewardValue = true,
 	showSilverCopperInList = false,
+	patronRecipeFilter = "all",
+	patronConcentrationFilter = "all",
+	patronSortKey = "profit",
+	patronSortAscending = false,
 }
 
 local function CopyDefaults(source, destination)

@@ -27,7 +27,7 @@ local ORDER_WIDTH = 340
 local COST_WIDTH = 96
 local REWARD_WIDTH = 124
 local PROFIT_WIDTH = 92
-local PATRON_WIDTH = 68
+local PATRON_WIDTH = 28
 local PRODUCT_ICON_SIZE = 50
 local PRODUCT_ICON_LEFT_OFFSET = 4
 local PRODUCT_ICON_TOP_OFFSET = -6
@@ -48,6 +48,12 @@ local CREATE_LIST_BUTTON_WIDTH = 22
 local CREATE_LIST_BUTTON_HEIGHT = 18
 local CREATE_LIST_BUTTON_LEFT_OFFSET = 4
 local CREATE_LIST_BUTTON_TOP_OFFSET = 19
+local FILTER_BUTTON_WIDTH = 88
+local FILTER_BUTTON_HEIGHT = HEADER_HEIGHT
+local FILTER_BUTTON_RIGHT_OFFSET = -2
+local FILTER_BUTTON_TOP_OFFSET = HEADER_TOP_OFFSET
+local FILTER_PANEL_WIDTH = 188
+local FILTER_PANEL_HEIGHT = 122
 local REQUEST_COOLDOWN = 0.75
 local REQUEST_TIMEOUT = 12
 local REQUEST_SETTLE_DELAY = 0.25
@@ -58,6 +64,12 @@ local INITIALIZE_RETRY_DELAY = 0.1
 local DONT_BUY_OVERLAY_TEXTURE = "Interface\\RaidFrame\\ReadyCheck-NotReady"
 local DETAIL_WARNING_ICON_TEXTURE = "Interface\\DialogFrame\\UI-Dialog-Icon-AlertNew"
 local DETAIL_WARNING_UPDATE_DELAY = 0.05
+local RECIPE_FILTER_ALL = "all"
+local RECIPE_FILTER_KNOWN = "known"
+local RECIPE_FILTER_UNKNOWN = "unknown"
+local CONCENTRATION_FILTER_ALL = "all"
+local CONCENTRATION_FILTER_NEEDS = "needs"
+local CONCENTRATION_FILTER_NONE = "none"
 
 local BORDER_BY_ITEM_QUALITY = {
 	[0] = "Professions-Slot-Frame",
@@ -120,6 +132,7 @@ local QUALITY_TICK_AMBER = "common-icon-checkmark-yellow"
 local QUALITY_WEIGHT_BASE = 1000
 local EMPTY_STATE_LOADING_TEXT = L.EMPTY_STATE_LOADING
 local EMPTY_STATE_EMPTY_TEXT = L.EMPTY_STATE_EMPTY
+local EMPTY_STATE_FILTERED_TEXT = L.EMPTY_STATE_FILTERED
 
 local EXPIRE_THRESHOLDS = {
 	{"|cffa0a0a0", 6 * 3600},
@@ -129,6 +142,7 @@ local EXPIRE_THRESHOLDS = {
 
 Pane.sortKey = ns.DEFAULT_SORT_KEY
 Pane.sortAscending = false
+Pane.allOrders = {}
 Pane.rows = {}
 Pane.orders = {}
 Pane.selectedOrderIDs = {}
@@ -144,6 +158,8 @@ Pane.pendingReason = nil
 Pane.pendingDueAt = nil
 Pane.visibleSessionId = 0
 Pane.requestReadinessRetryCount = 0
+Pane.recipeFilter = RECIPE_FILTER_ALL
+Pane.concentrationFilter = CONCENTRATION_FILTER_ALL
 
 local function FormatCount(count, alwaysShow)
 	if count and (count > 1 or (alwaysShow and count > 0)) then
@@ -403,7 +419,7 @@ end
 
 local function GetTimeHeaderText()
 	if type(CreateAtlasMarkup) == "function" then
-		return CreateAtlasMarkup("auctionhouse-icon-clock", 16, 16, 2, -2)
+		return CreateAtlasMarkup("auctionhouse-icon-clock", 14, 14, 0, -1)
 	end
 
 	return L.TIME_HEADER
@@ -475,7 +491,7 @@ end
 local function GetRefreshDelay(reason)
 	if reason == "show" or reason == "order-type" then
 		return 0.01
-	elseif reason == "sort" then
+	elseif reason == "sort" or reason == "filter" then
 		return 0
 	elseif reason == "pricing-db" or reason == "trade-skill-source" or (type(reason) == "string" and reason:match("^config:")) then
 		return 0.1
@@ -552,6 +568,364 @@ local function CreateHeaderButton(parent, text, sortKey, width, xOffset)
 	button.sortKey = sortKey
 	button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 	return button
+end
+
+local function CreateBlizzardFilterButton(parent)
+	return CreateFrame("Button", nil, parent)
+end
+
+local function SetFallbackFilterButtonLabel(button, text)
+	if not button then
+		return
+	end
+
+	if button.fallbackText and type(button.fallbackText.SetText) == "function" then
+		button.fallbackText:SetText(text)
+	end
+end
+
+local function CreateFallbackFilterButtonVisuals(button, text)
+	if not button or button.fallbackVisualsCreated then
+		SetFallbackFilterButtonLabel(button, text)
+		return
+	end
+
+	button.fallbackVisualsCreated = true
+	button.fallbackBackground = button:CreateTexture(nil, "BACKGROUND")
+	button.fallbackBackground:SetAllPoints()
+	button.fallbackBackground:SetColorTexture(0.08, 0.08, 0.075, 0.95)
+	button.fallbackBorder = button:CreateTexture(nil, "BORDER")
+	button.fallbackBorder:SetAllPoints()
+	button.fallbackBorder:SetColorTexture(0.32, 0.32, 0.3, 0.75)
+	button.fallbackInset = button:CreateTexture(nil, "ARTWORK")
+	button.fallbackInset:SetPoint("TOPLEFT", button, "TOPLEFT", 2, -2)
+	button.fallbackInset:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -2, 2)
+	button.fallbackInset:SetColorTexture(0.03, 0.03, 0.028, 0.95)
+	button.fallbackText = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	button.fallbackText:SetPoint("LEFT", button, "LEFT", 8, 0)
+	button.fallbackText:SetPoint("RIGHT", button, "RIGHT", -17, 0)
+	button.fallbackText:SetJustifyH("CENTER")
+	button.fallbackArrow = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	button.fallbackArrow:SetPoint("RIGHT", button, "RIGHT", -7, 0)
+	button.fallbackArrow:SetText(">")
+	SetFallbackFilterButtonLabel(button, text)
+end
+
+local function SetFallbackFilterButtonVisualsShown(button, shown)
+	if not button then
+		return
+	end
+
+	for _, key in ipairs({ "fallbackBackground", "fallbackBorder", "fallbackInset", "fallbackText", "fallbackArrow" }) do
+		local region = button[key]
+		if region then
+			region:SetShown(shown)
+		end
+	end
+end
+
+local function IsDescendantOf(frame, ancestor)
+	local parent = frame
+	while parent do
+		if parent == ancestor then
+			return true
+		end
+		parent = type(parent.GetParent) == "function" and parent:GetParent() or nil
+	end
+
+	return false
+end
+
+local function GetFrameLabelText(frame)
+	if not frame then
+		return nil
+	end
+
+	if type(frame.GetText) == "function" then
+		local text = frame:GetText()
+		if type(text) == "string" and text ~= "" then
+			return text
+		end
+	end
+
+	for _, key in ipairs({ "Text", "Label", "text" }) do
+		local region = frame[key]
+		if region and type(region.GetText) == "function" then
+			local text = region:GetText()
+			if type(text) == "string" and text ~= "" then
+				return text
+			end
+		end
+	end
+
+	local regionCount = type(frame.GetRegions) == "function" and select("#", frame:GetRegions()) or 0
+	for index = 1, regionCount do
+		local region = select(index, frame:GetRegions())
+		if region and type(region.GetObjectType) == "function" and region:GetObjectType() == "FontString" and type(region.GetText) == "function" then
+			local text = region:GetText()
+			if type(text) == "string" and text ~= "" then
+				return text
+			end
+		end
+	end
+
+	return nil
+end
+
+local function FindLeftRecipeFilterButton(root)
+	local expectedText = (L and L.TOOLBAR_FILTER_BUTTON) or FILTER or "Filter"
+	local bestButton
+	local bestScore = math.huge
+	local rootLeft = root and type(root.GetLeft) == "function" and root:GetLeft()
+	local rootTop = root and type(root.GetTop) == "function" and root:GetTop()
+
+	local function visit(frame, depth)
+		if not frame or depth > 12 then
+			return
+		end
+
+		if frame ~= root and not IsDescendantOf(frame, root) and type(frame.GetObjectType) == "function" then
+			local objectType = frame:GetObjectType()
+			local text = GetFrameLabelText(frame)
+			if (objectType == "Button" or objectType == "DropdownButton") and text == expectedText then
+				local width = type(frame.GetWidth) == "function" and frame:GetWidth() or 0
+				local height = type(frame.GetHeight) == "function" and frame:GetHeight() or 0
+				if width >= 40 and width <= 180 and height >= 14 and height <= 40 then
+					local score = 1000
+					local left = type(frame.GetLeft) == "function" and frame:GetLeft()
+					local right = type(frame.GetRight) == "function" and frame:GetRight()
+					local top = type(frame.GetTop) == "function" and frame:GetTop()
+					if rootLeft and right and right <= rootLeft + 12 then
+						score = score - 600 + math.abs((rootLeft or 0) - right)
+					end
+					if rootTop and top then
+						score = score + math.abs(rootTop - top)
+					end
+					if score < bestScore then
+						bestScore = score
+						bestButton = frame
+					end
+				end
+			end
+		end
+
+		local childCount = type(frame.GetChildren) == "function" and select("#", frame:GetChildren()) or 0
+		for index = 1, childCount do
+			visit(select(index, frame:GetChildren()), depth + 1)
+		end
+	end
+
+	visit(ProfessionsFrame, 0)
+	return bestButton
+end
+
+local function CopyRegionAnchors(source, target, sourceRoot, targetRoot, scaleX, scaleY)
+	target:ClearAllPoints()
+	local pointCount = type(source.GetNumPoints) == "function" and source:GetNumPoints() or 0
+	if pointCount == 0 then
+		target:SetAllPoints(targetRoot)
+		return
+	end
+
+	for index = 1, pointCount do
+		local point, relativeTo, relativePoint, xOffset, yOffset = source:GetPoint(index)
+		if point then
+			local relative = relativeTo == sourceRoot and targetRoot or targetRoot
+			target:SetPoint(point, relative, relativePoint or point, (xOffset or 0) * scaleX, (yOffset or 0) * scaleY)
+		end
+	end
+end
+
+local function CopyTextureRegion(source, targetRoot, sourceRoot, scaleX, scaleY)
+	local layer, sublevel = source:GetDrawLayer()
+	local copy = targetRoot:CreateTexture(nil, layer or "ARTWORK", nil, sublevel or 0)
+	local atlas = type(source.GetAtlas) == "function" and source:GetAtlas()
+	if atlas then
+		copy:SetAtlas(atlas, false)
+	else
+		copy:SetTexture(source:GetTexture())
+	end
+	copy:SetTexCoord(source:GetTexCoord())
+	copy:SetVertexColor(source:GetVertexColor())
+	if type(source.IsDesaturated) == "function" and type(copy.SetDesaturated) == "function" then
+		copy:SetDesaturated(source:IsDesaturated())
+	end
+	if type(source.GetBlendMode) == "function" and type(copy.SetBlendMode) == "function" then
+		copy:SetBlendMode(source:GetBlendMode())
+	end
+	if type(source.GetAlpha) == "function" then
+		copy:SetAlpha(source:GetAlpha())
+	end
+	local width, height = source:GetSize()
+	copy:SetSize((width or 0) * scaleX, (height or 0) * scaleY)
+	CopyRegionAnchors(source, copy, sourceRoot, targetRoot, scaleX, scaleY)
+	return copy
+end
+
+local function CopyFontStringRegion(source, targetRoot, sourceRoot, scaleX, scaleY)
+	local layer, sublevel = source:GetDrawLayer()
+	local copy = targetRoot:CreateFontString(nil, layer or "ARTWORK", nil)
+	local fontObject = type(source.GetFontObject) == "function" and source:GetFontObject()
+	if fontObject then
+		copy:SetFontObject(fontObject)
+	end
+	local font, size, flags = source:GetFont()
+	if font and size then
+		copy:SetFont(font, math.max(8, size * math.min(scaleX, scaleY)), flags)
+	end
+	copy:SetText(source:GetText() or "")
+	copy:SetTextColor(source:GetTextColor())
+	copy:SetJustifyH(source:GetJustifyH())
+	copy:SetJustifyV(source:GetJustifyV())
+	copy:SetShadowColor(source:GetShadowColor())
+	local shadowX, shadowY = source:GetShadowOffset()
+	copy:SetShadowOffset((shadowX or 0) * scaleX, (shadowY or 0) * scaleY)
+	if type(source.GetAlpha) == "function" then
+		copy:SetAlpha(source:GetAlpha())
+	end
+	local width, height = source:GetSize()
+	copy:SetSize((width or 0) * scaleX, (height or 0) * scaleY)
+	CopyRegionAnchors(source, copy, sourceRoot, targetRoot, scaleX, scaleY)
+	return copy
+end
+
+local function CopyFilterFrameVisuals(sourceFrame, targetFrame, sourceRoot, targetRoot, scaleX, scaleY, visuals, depth)
+	if not sourceFrame or not targetFrame or depth > 3 then
+		return
+	end
+
+	local regionCount = type(sourceFrame.GetRegions) == "function" and select("#", sourceFrame:GetRegions()) or 0
+	for index = 1, regionCount do
+		local region = select(index, sourceFrame:GetRegions())
+		if region and type(region.GetObjectType) == "function" and (type(region.IsShown) ~= "function" or region:IsShown()) then
+			local objectType = region:GetObjectType()
+			local copy
+			if objectType == "Texture" then
+				copy = CopyTextureRegion(region, targetFrame, sourceFrame, scaleX, scaleY)
+			elseif objectType == "FontString" then
+				copy = CopyFontStringRegion(region, targetFrame, sourceFrame, scaleX, scaleY)
+			end
+			if copy then
+				visuals[#visuals + 1] = copy
+			end
+		end
+	end
+
+	local childCount = type(sourceFrame.GetChildren) == "function" and select("#", sourceFrame:GetChildren()) or 0
+	for index = 1, childCount do
+		local child = select(index, sourceFrame:GetChildren())
+		if child and child:IsShown() and type(child.GetSize) == "function" then
+			local childWidth, childHeight = child:GetSize()
+			if childWidth and childHeight and childWidth > 0 and childHeight > 0 and childWidth <= 220 and childHeight <= 80 then
+				local childCopy = CreateFrame("Frame", nil, targetFrame)
+				childCopy:SetSize(childWidth * scaleX, childHeight * scaleY)
+				CopyRegionAnchors(child, childCopy, sourceRoot, targetRoot, scaleX, scaleY)
+				visuals[#visuals + 1] = childCopy
+				CopyFilterFrameVisuals(child, childCopy, child, childCopy, scaleX, scaleY, visuals, depth + 1)
+			end
+		end
+	end
+end
+
+local function ClearCopiedFilterButtonVisuals(button)
+	if not button or not button.copiedFilterVisuals then
+		return
+	end
+
+	for _, visual in ipairs(button.copiedFilterVisuals) do
+		visual:Hide()
+	end
+	button.copiedFilterVisuals = nil
+	button.copiedFilterVisualSource = nil
+end
+
+local function CopyFilterButtonVisuals(source, target)
+	if not source or not target then
+		return false
+	end
+
+	ClearCopiedFilterButtonVisuals(target)
+	target.copiedFilterVisuals = {}
+
+	local sourceWidth, sourceHeight = source:GetSize()
+	local targetWidth, targetHeight = target:GetSize()
+	local scaleX = sourceWidth and sourceWidth > 0 and targetWidth / sourceWidth or 1
+	local scaleY = sourceHeight and sourceHeight > 0 and targetHeight / sourceHeight or 1
+
+	CopyFilterFrameVisuals(source, target, source, target, scaleX, scaleY, target.copiedFilterVisuals, 0)
+
+	target.copiedFilterVisualSource = source
+	SetFallbackFilterButtonVisualsShown(target, false)
+	return #target.copiedFilterVisuals > 0
+end
+
+local function NormalizeRecipeFilter(filterKey)
+	if filterKey == RECIPE_FILTER_KNOWN or filterKey == RECIPE_FILTER_UNKNOWN then
+		return filterKey
+	end
+
+	return RECIPE_FILTER_ALL
+end
+
+local function NormalizeConcentrationFilter(filterKey)
+	if filterKey == CONCENTRATION_FILTER_NEEDS or filterKey == CONCENTRATION_FILTER_NONE then
+		return filterKey
+	end
+
+	return CONCENTRATION_FILTER_ALL
+end
+
+local function NormalizeSortKey(sortKey)
+	if sortKey == "order"
+		or sortKey == "cost"
+		or sortKey == "reward"
+		or sortKey == "profit"
+		or sortKey == "time" then
+		return sortKey
+	end
+
+	return ns.DEFAULT_SORT_KEY or "profit"
+end
+
+local function DoesOrderNeedConcentration(orderData)
+	local concentration = orderData and orderData.concentration
+	return type(concentration) == "table"
+		and (tonumber(concentration.currentCost) or 0) > 0
+end
+
+local function CreateFilterMenuToggle(parent, text, anchor, offsetY)
+	local button = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+	button:SetSize(22, 22)
+	button:SetPoint("TOPLEFT", anchor, "TOPLEFT", -1, offsetY)
+	button.text = button.text or button.Text
+	if not button.text then
+		button.text = button:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	end
+	if button.text then
+		button.text:ClearAllPoints()
+		button.text:SetPoint("LEFT", button, "RIGHT", 9, 0)
+		button.text:SetPoint("RIGHT", parent, "RIGHT", -12, 0)
+		button.text:SetHeight(22)
+		button.text:SetText(text)
+		button.text:SetFontObject(GameFontHighlight)
+		button.text:SetJustifyH("LEFT")
+		button.text:SetTextColor(1, 1, 1)
+	end
+	if type(button.SetHitRectInsets) == "function" then
+		button:SetHitRectInsets(0, -(FILTER_PANEL_WIDTH - 46), -2, -2)
+	end
+	return button
+end
+
+local function SetFilterMenuToggleChecked(button, checked)
+	if not button then
+		return
+	end
+
+	button:SetChecked(checked)
+	if button.text then
+		button.text:SetTextColor(1, 1, 1)
+	end
 end
 
 local function GetCraftingReagentDescriptor(reagentInfo)
@@ -3055,18 +3429,32 @@ function Pane:ViewOrder(orderData)
 	ns.Print(L.MSG_ORDER_NO_LONGER_AVAILABLE)
 end
 
-function Pane:CreateRow(index)
-	local row = CreateFrame("Button", nil, self.scrollChild)
+function Pane:CreateRow(index, row)
+	local hasNativeLayout = row ~= nil
+	row = row or CreateFrame("Button", nil, self.scrollChild or self.scrollFrame)
+	row.rowIndex = index or row.rowIndex or 1
+	if row.craftingOrdersInitialized then
+		return row
+	end
+
+	row.craftingOrdersInitialized = true
+	if self.rows and not row.trackedByPane then
+		row.trackedByPane = true
+		self.rows[#self.rows + 1] = row
+	end
 	row:SetHeight(ROW_HEIGHT)
-	row:SetPoint("LEFT", self.scrollChild, "LEFT", 0, 0)
-	row:SetPoint("RIGHT", self.scrollChild, "RIGHT", -2, 0)
+	row:SetWidth(CONTENT_WIDTH)
+	if not hasNativeLayout and self.scrollChild then
+		row:SetPoint("LEFT", self.scrollChild, "LEFT", 0, 0)
+		row:SetPoint("RIGHT", self.scrollChild, "RIGHT", -2, 0)
+	end
 	row:SetHighlightAtlas("talents-pvpflyout-rowhighlight")
 	row:GetHighlightTexture():SetVertexColor(0.12, 0.48, 0.95)
 	row:GetHighlightTexture():SetAlpha(0.75)
 
 	row.background = row:CreateTexture(nil, "BACKGROUND")
 	row.background:SetAllPoints()
-	row.background:SetColorTexture(1, 1, 1, index % 2 == 0 and 0.025 or 0.01)
+	row.background:SetColorTexture(1, 1, 1, row.rowIndex % 2 == 0 and 0.025 or 0.01)
 
 	row.checkbox = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
 	row.checkbox:SetPoint("TOPLEFT", row, "TOPLEFT", 2, -12)
@@ -3178,7 +3566,7 @@ end
 
 function Pane:EnsureRowCount(count)
 	while #self.rows < count do
-		self.rows[#self.rows + 1] = self:CreateRow(#self.rows + 1)
+		self:CreateRow(#self.rows + 1)
 	end
 end
 
@@ -3246,6 +3634,16 @@ function Pane:UpdateToolbar()
 		end
 	end
 	self.createListButton:SetEnabled(selectedCount > 0 and provider ~= nil)
+
+	if self.filterButton then
+		SetFallbackFilterButtonLabel(self.filterButton, L.TOOLBAR_FILTER_BUTTON)
+		self.filterButton.tooltipTitle = L.TOOLBAR_FILTER_MENU
+		self.filterButton.tooltipText = L.TOOLBAR_FILTER_TOOLTIP
+		self.filterButton.recipeFilterLabel = self:GetRecipeFilterLabel()
+		self.filterButton.concentrationFilterLabel = self:GetConcentrationFilterLabel()
+	end
+
+	self:UpdateFilterPanel()
 end
 
 function Pane:CollectShoppingEntries()
@@ -3348,6 +3746,20 @@ function Pane:ApplyReferenceLayout()
 	self.root:SetPoint("BOTTOMRIGHT", browseFrame, "BOTTOMRIGHT", ROOT_RIGHT_OFFSET, ROOT_BOTTOM_OFFSET)
 end
 
+function Pane:ApplyLeftFilterButtonVisuals()
+	if not self.root or not self.filterButton then
+		return
+	end
+
+	local source = FindLeftRecipeFilterButton(self.root)
+	if source and CopyFilterButtonVisuals(source, self.filterButton) then
+		return
+	end
+
+	CreateFallbackFilterButtonVisuals(self.filterButton, L.TOOLBAR_FILTER_BUTTON)
+	SetFallbackFilterButtonVisualsShown(self.filterButton, true)
+end
+
 function Pane:BuildFrame()
 	if self.root then
 		return true
@@ -3384,6 +3796,79 @@ function Pane:BuildFrame()
 	end)
 	self.createListButton:SetScript("OnLeave", GameTooltip_Hide)
 
+	self.filterButton = CreateBlizzardFilterButton(root)
+	self.filterButton:SetPoint("TOPRIGHT", root, "TOPRIGHT", FILTER_BUTTON_RIGHT_OFFSET, FILTER_BUTTON_TOP_OFFSET)
+	self.filterButton:SetSize(FILTER_BUTTON_WIDTH, FILTER_BUTTON_HEIGHT)
+	self.filterButton:SetMotionScriptsWhileDisabled(true)
+	CreateFallbackFilterButtonVisuals(self.filterButton, L.TOOLBAR_FILTER_BUTTON)
+	self.filterButton:SetScript("OnClick", function()
+		Pane:ToggleFilterPanel()
+	end)
+	self.filterButton:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+		GameTooltip:SetText(self.tooltipTitle or L.TOOLBAR_FILTER_MENU)
+		GameTooltip:AddLine(self.tooltipText or L.TOOLBAR_FILTER_TOOLTIP, 1, 1, 1, true)
+		GameTooltip:AddLine(" ")
+		GameTooltip:AddDoubleLine(L.FILTER_RECIPE_HEADER, self.recipeFilterLabel or Pane:GetRecipeFilterLabel(), 1, 1, 1, 1, 1, 1)
+		GameTooltip:AddDoubleLine(L.FILTER_CONCENTRATION_HEADER, self.concentrationFilterLabel or Pane:GetConcentrationFilterLabel(), 1, 1, 1, 1, 1, 1)
+		GameTooltip:Show()
+	end)
+	self.filterButton:SetScript("OnLeave", function(self)
+		GameTooltip_Hide()
+	end)
+
+	self.filterPanel = CreateFrame("Frame", nil, root, BackdropTemplateMixin and "BackdropTemplate" or nil)
+	self.filterPanel:SetPoint("TOPRIGHT", self.filterButton, "BOTTOMRIGHT", 0, -4)
+	self.filterPanel:SetSize(FILTER_PANEL_WIDTH, FILTER_PANEL_HEIGHT)
+	self.filterPanel:SetFrameStrata("DIALOG")
+	self.filterPanel:SetFrameLevel(root:GetFrameLevel() + 20)
+	if type(self.filterPanel.SetBackdrop) == "function" then
+		self.filterPanel:SetBackdrop({
+			bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+			tile = true,
+			tileSize = 16,
+			edgeSize = 16,
+			insets = {
+				left = 4,
+				right = 4,
+				top = 4,
+				bottom = 4,
+			},
+		})
+		self.filterPanel:SetBackdropColor(0.02, 0.02, 0.02, 0.92)
+		self.filterPanel:SetBackdropBorderColor(0.55, 0.55, 0.55, 1)
+	end
+	self.filterPanel:Hide()
+
+	self.filterPanel.recipeHeader = self.filterPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	self.filterPanel.recipeHeader:SetPoint("TOPLEFT", self.filterPanel, "TOPLEFT", 12, -12)
+	self.filterPanel.recipeHeader:SetWidth(FILTER_PANEL_WIDTH - 28)
+	self.filterPanel.recipeHeader:SetJustifyH("LEFT")
+	self.filterPanel.recipeHeader:SetText(L.FILTER_RECIPE_HEADER)
+
+	self.recipeFilterButtons = {
+		[RECIPE_FILTER_KNOWN] = CreateFilterMenuToggle(self.filterPanel, L.FILTER_RECIPE_KNOWN, self.filterPanel.recipeHeader, -17),
+	}
+
+	self.recipeFilterButtons[RECIPE_FILTER_KNOWN]:SetScript("OnClick", function()
+		Pane:SetRecipeFilter(Pane.recipeFilter == RECIPE_FILTER_KNOWN and RECIPE_FILTER_ALL or RECIPE_FILTER_KNOWN)
+	end)
+
+	self.filterPanel.concentrationHeader = self.filterPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	self.filterPanel.concentrationHeader:SetPoint("TOPLEFT", self.recipeFilterButtons[RECIPE_FILTER_KNOWN], "BOTTOMLEFT", 2, -12)
+	self.filterPanel.concentrationHeader:SetWidth(FILTER_PANEL_WIDTH - 28)
+	self.filterPanel.concentrationHeader:SetJustifyH("LEFT")
+	self.filterPanel.concentrationHeader:SetText(L.FILTER_CONCENTRATION_HEADER)
+
+	self.concentrationFilterButtons = {
+		[CONCENTRATION_FILTER_NONE] = CreateFilterMenuToggle(self.filterPanel, L.FILTER_CONCENTRATION_NONE, self.filterPanel.concentrationHeader, -17),
+	}
+
+	self.concentrationFilterButtons[CONCENTRATION_FILTER_NONE]:SetScript("OnClick", function()
+		Pane:SetConcentrationFilter(Pane.concentrationFilter == CONCENTRATION_FILTER_NONE and CONCENTRATION_FILTER_ALL or CONCENTRATION_FILTER_NONE)
+	end)
+
 	self.headers = {
 		order = CreateHeaderButton(root, L.HEADER_YOU_CRAFT_SUPPLY, "order", ORDER_WIDTH, SELECT_WIDTH + 2),
 		cost = CreateHeaderButton(root, L.HEADER_COST, "cost", COST_WIDTH, SELECT_WIDTH + ORDER_WIDTH + 2),
@@ -3394,33 +3879,73 @@ function Pane:BuildFrame()
 
 	for _, header in pairs(self.headers) do
 		header:SetScript("OnClick", function(button, mouseButton)
+			local sortAscending
 			if Pane.sortKey == button.sortKey then
-				Pane.sortAscending = mouseButton == "RightButton" and true or not Pane.sortAscending
+				sortAscending = mouseButton == "RightButton" and true or not Pane.sortAscending
 			else
-				Pane.sortKey = button.sortKey
-				Pane.sortAscending = mouseButton == "RightButton"
+				sortAscending = mouseButton == "RightButton"
 			end
-			Pane:MarkDirty("sort")
+			Pane:SetSort(button.sortKey, sortAscending)
 		end)
 	end
 
 	self.sortArrow = root:CreateTexture(nil, "ARTWORK")
 	self.sortArrow:SetAtlas("auctionhouse-ui-sortarrow", true)
 
-	self.scrollFrame = CreateFrame("ScrollFrame", nil, root, "UIPanelScrollFrameTemplate")
-	self.scrollFrame:SetPoint("TOPLEFT", root, "TOPLEFT", 0, SCROLL_TOP_OFFSET)
-	self.scrollFrame:SetPoint("BOTTOMRIGHT", root, "BOTTOMRIGHT", -28, 10)
-	self.scrollChild = CreateFrame("Frame", nil, self.scrollFrame)
-	self.scrollChild:SetSize(CONTENT_WIDTH, 1)
-	self.scrollFrame:SetScrollChild(self.scrollChild)
+	local scrollBarInset = 10
+	local scrollBarGap = 10
 
-	self.noOrders = self.scrollChild:CreateFontString(nil, "ARTWORK", "GameFontDisableLarge")
-	self.noOrders:SetPoint("TOP", self.scrollChild, "TOP", 0, -120)
+	self.scrollFrame = CreateFrame("Frame", nil, root, "WowScrollBoxList")
+	self.scrollFrame:SetPoint("TOPLEFT", root, "TOPLEFT", 0, SCROLL_TOP_OFFSET)
+
+	self.scrollBar = CreateFrame("EventFrame", nil, root, "MinimalScrollBar")
+	self.scrollBar:SetPoint("TOPRIGHT", root, "TOPRIGHT", -scrollBarInset, SCROLL_TOP_OFFSET)
+	self.scrollBar:SetPoint("BOTTOMRIGHT", root, "BOTTOMRIGHT", -scrollBarInset, 10)
+
+	self.scrollFrame:SetPoint("TOPRIGHT", self.scrollBar, "TOPLEFT", -scrollBarGap, 0)
+	self.scrollFrame:SetPoint("BOTTOMRIGHT", self.scrollBar, "BOTTOMLEFT", -scrollBarGap, 0)
+
+	if self.scrollFrame.SetInterpolateScroll then
+		self.scrollFrame:SetInterpolateScroll(true)
+	end
+	if self.scrollBar.SetInterpolateScroll then
+		self.scrollBar:SetInterpolateScroll(true)
+	end
+
+	local scrollView = CreateScrollBoxListLinearView()
+	scrollView:SetElementExtent(ROW_HEIGHT)
+	if scrollView.SetPadding then
+		scrollView:SetPadding(0, 0, 0, 0, 0)
+	end
+	scrollView:SetElementInitializer("Button", function(button, elementData)
+		Pane:CreateRow(elementData and elementData.index, button)
+		Pane:ApplyRowData(button, elementData)
+	end)
+	if scrollView.SetElementResetter then
+		scrollView:SetElementResetter(function(button)
+			button.order = nil
+		end)
+	end
+
+	ScrollUtil.InitScrollBoxListWithScrollBar(self.scrollFrame, self.scrollBar, scrollView)
+	self.orderDataProvider = CreateDataProvider()
+	self.scrollFrame:SetDataProvider(self.orderDataProvider)
+	self.rows = {}
+
+	self.noOrders = root:CreateFontString(nil, "ARTWORK", "GameFontDisableLarge")
+	self.noOrders:SetPoint("CENTER", self.scrollFrame, "CENTER", 0, 40)
 	self.noOrders:SetText(EMPTY_STATE_EMPTY_TEXT)
 	self.noOrders:Hide()
 
 	root:SetScript("OnShow", function()
 		Pane:ApplyReferenceLayout()
+		Pane:ApplyLeftFilterButtonVisuals()
+		C_Timer.After(0, function()
+			if Pane and Pane.root and Pane.root:IsShown() then
+				Pane:ApplyLeftFilterButtonVisuals()
+				Pane:UpdateScrollBox()
+			end
+		end)
 		Pane:BeginVisibleSession()
 		Pane:MarkDirty("show")
 	end)
@@ -3492,9 +4017,10 @@ function Pane:HideAllRows()
 		row.order = nil
 	end
 
-	if self.scrollChild then
-		self.scrollChild:SetHeight(1)
+	if self.orderDataProvider then
+		self.orderDataProvider:Flush()
 	end
+	self:UpdateScrollBox()
 end
 
 function Pane:SetRowIcons(row, bucketName, startX, yOffset, items)
@@ -3539,144 +4065,177 @@ function Pane:SortPreparedOrders()
 	SortOrders(self.orders, self.sortKey, self.sortAscending)
 end
 
-function Pane:RenderRows()
-	self:EnsureRowCount(#self.orders)
+function Pane:UpdateScrollBox()
+	if self.scrollFrame and self.scrollFrame.FullUpdate then
+		local updateImmediately = ScrollBoxConstants and ScrollBoxConstants.UpdateImmediately or true
+		self.scrollFrame:FullUpdate(updateImmediately)
+	end
+end
 
-	for index, row in ipairs(self.rows) do
-		local order = self.orders[index]
-		if order then
-			row.order = order
-			row:Show()
-			row:SetPoint("TOPLEFT", self.scrollChild, "TOPLEFT", 0, -(index - 1) * ROW_HEIGHT)
-			row.checkbox:SetChecked(not not self.selectedOrderIDs[order.orderID])
-
-			local titleColor = WHITE_FONT_COLOR
-			local desaturated = false
-			local greyUnknown = not order.isKnown and ns.GetConfig("greyUnknownRecipes")
-			if greyUnknown then
-				titleColor = DISABLED_FONT_COLOR
-				desaturated = true
-			end
-			row:SetAlpha(greyUnknown and 0.6 or 1)
-			local inlineFlags = order.isKnown and self:GetFlagText(order) or ""
-			if inlineFlags ~= "" then
-				inlineFlags = "  " .. inlineFlags
-			end
-			row.title:SetText(order.product.label .. GetQualityIndicatorText(order) .. inlineFlags)
-			row.title:SetTextColor(titleColor.r, titleColor.g, titleColor.b)
-			row.flags:SetText("")
-			row.flags:Hide()
-			self:SetIconData(row.productIcon, {
-				itemID = order.product.itemID,
-				itemLink = order.product.itemLink,
-				icon = order.product.icon,
-				count = 1,
-				isKnown = order.isKnown,
-				desaturated = desaturated,
-				extraLines = order.productTooltipLines,
-				unknownRecipeLines = order.isKnown and nil or order.unknownRecipeTooltip,
-			})
-
-			local reagentIcons = {}
-			for _, entry in ipairs(GetMaterialPlanEntries(order)) do
-				local option = entry.option
-				if option then
-					reagentIcons[#reagentIcons + 1] = {
-						itemID = option.itemID,
-						itemLink = option.itemLink,
-						icon = select(5, C_Item.GetItemInfoInstant(option.itemID)),
-						count = entry.quantity,
-						alwaysShowCount = true,
-						name = option.name,
-						reagentQuality = option.reagentQuality,
-						borderAtlas = option.borderAtlas,
-						shortage = entry.shortage,
-						availableTotal = entry.availableTotal,
-						selectedQualityOwnedCount = entry.selectedQualityOwnedCount,
-						otherQualityOwnedCount = entry.otherQualityOwnedCount,
-						totalOwnedCount = entry.totalOwnedCount,
-						unitPrice = option.unitPrice,
-						totalPrice = entry.totalPrice,
-						priceState = entry.priceState,
-						doNotBuy = self:IsDontBuyItem(option.itemID),
-						toggleDontBuy = true,
-					}
-				end
-			end
-
-			if order.concentration and order.concentration.currentCost and order.concentration.currencyID then
-				local currencyBasic = C_CurrencyInfo.GetBasicCurrencyInfo(order.concentration.currencyID, order.concentration.currentCost)
-				reagentIcons[#reagentIcons + 1] = {
-					currencyID = order.concentration.currencyID,
-					icon = currencyBasic and currencyBasic.icon,
-					count = order.concentration.currentCost,
-					alwaysShowCount = true,
-					borderAtlas = GetBorderAtlas(nil, currencyBasic and currencyBasic.quality),
-					leadingSpacer = #reagentIcons > 0,
-					availableTotal = order.concentration.available,
-					shortage = math.max(0, (order.concentration.currentCost or 0) - (order.concentration.available or 0)),
-					extraLines = BuildConcentrationExtraLines(order.concentration),
-				}
-			end
-
-			row.reagentLabel:Hide()
-			self:SetRowIcons(row, "reagentIcons", SELECT_WIDTH + PRODUCT_ICON_LEFT_OFFSET + PRODUCT_ICON_SIZE + PRODUCT_TEXT_GAP, ROW_ICON_Y_OFFSET, reagentIcons)
-
-			if #GetMaterialPlanEntries(order) == 0 then
-				row.costText:SetText(NONE)
-				row.costHint:SetText(L.COST_HINT_ALL_PROVIDED)
-			elseif (order.marketableMaterialEntryCount or 0) == 0 and (order.excludedMaterialEntryCount or 0) > 0 then
-				row.costText:SetText(NONE)
-				row.costHint:SetText(L.PRICE_NOT_MARKETABLE)
-			elseif order.materialCostKnown then
-				local costText = FormatListMoney(order.materialCost)
-				if not order.materialCostComplete then
-					costText = costText .. "*"
-				end
-				row.costText:SetText(costText)
-				row.costHint:SetText(order.materialCostComplete and L.COST_HINT_ALL_PRICED or L.COST_HINT_PARTIAL_PRICING)
-			else
-				row.costText:SetText(NONE)
-				row.costHint:SetText(L.PRICE_NO_MARKET_DATA)
-			end
-
-			row.rewardText:SetText(order.reward.gold > 0 and FormatListMoney(order.reward.gold) or NONE)
-			row.rewardValue:SetText("")
-
-			if order.profitKnown then
-				local profitText = FormatListMoney(order.profitValue or 0, true)
-				if not order.profitComplete then
-					profitText = profitText .. "*"
-				end
-				row.profitText:SetText(profitText)
-				if (order.profitValue or 0) < 0 then
-					row.profitText:SetTextColor(RED_FONT_COLOR.r, RED_FONT_COLOR.g, RED_FONT_COLOR.b)
-				else
-					row.profitText:SetTextColor(HIGHLIGHT_FONT_COLOR.r, HIGHLIGHT_FONT_COLOR.g, HIGHLIGHT_FONT_COLOR.b)
-				end
-			else
-				row.profitText:SetText(NONE)
-				row.profitText:SetTextColor(DISABLED_FONT_COLOR.r, DISABLED_FONT_COLOR.g, DISABLED_FONT_COLOR.b)
-			end
-
-			for _, icon in ipairs(order.reward.icons) do
-				if icon.itemID and not icon.icon then
-					icon.icon = select(5, C_Item.GetItemInfoInstant(icon.itemID))
-				end
-			end
-			self:SetRowIcons(row, "rewardIcons", SELECT_WIDTH + ORDER_WIDTH + COST_WIDTH + 8, ROW_ICON_Y_OFFSET, order.reward.icons)
-
-			local secondsRemaining = math.max(0, (order.expirationTime or 0) - C_CraftingOrders.GetCraftingOrderTime())
-			local red, green, blue = GetTimeColor(secondsRemaining)
-			row.timeLeft:SetText(FormatTimeRemaining(secondsRemaining))
-			row.timeLeft:SetTextColor(red, green, blue)
-		else
+function Pane:ApplyRowData(row, elementData)
+	local order = elementData and (elementData.order or elementData)
+	if not row or not order then
+		if row then
 			row:Hide()
 			row.order = nil
 		end
+		return
 	end
 
-	self.scrollChild:SetHeight(math.max(1, #self.orders * ROW_HEIGHT))
+	local index = elementData.index or row.rowIndex or 1
+	row.rowIndex = index
+	row.order = order
+	row:Show()
+	if row.background then
+		row.background:SetColorTexture(1, 1, 1, index % 2 == 0 and 0.025 or 0.01)
+	end
+	row.checkbox:SetChecked(not not self.selectedOrderIDs[order.orderID])
+
+	local titleColor = WHITE_FONT_COLOR
+	local desaturated = false
+	local greyUnknown = not order.isKnown and ns.GetConfig("greyUnknownRecipes")
+	if greyUnknown then
+		titleColor = DISABLED_FONT_COLOR
+		desaturated = true
+	end
+	row:SetAlpha(greyUnknown and 0.6 or 1)
+	local inlineFlags = order.isKnown and self:GetFlagText(order) or ""
+	if inlineFlags ~= "" then
+		inlineFlags = "  " .. inlineFlags
+	end
+	row.title:SetText(order.product.label .. GetQualityIndicatorText(order) .. inlineFlags)
+	row.title:SetTextColor(titleColor.r, titleColor.g, titleColor.b)
+	row.flags:SetText("")
+	row.flags:Hide()
+	self:SetIconData(row.productIcon, {
+		itemID = order.product.itemID,
+		itemLink = order.product.itemLink,
+		icon = order.product.icon,
+		count = 1,
+		isKnown = order.isKnown,
+		desaturated = desaturated,
+		extraLines = order.productTooltipLines,
+		unknownRecipeLines = order.isKnown and nil or order.unknownRecipeTooltip,
+	})
+
+	local reagentIcons = {}
+	for _, entry in ipairs(GetMaterialPlanEntries(order)) do
+		local option = entry.option
+		if option then
+			reagentIcons[#reagentIcons + 1] = {
+				itemID = option.itemID,
+				itemLink = option.itemLink,
+				icon = select(5, C_Item.GetItemInfoInstant(option.itemID)),
+				count = entry.quantity,
+				alwaysShowCount = true,
+				name = option.name,
+				reagentQuality = option.reagentQuality,
+				borderAtlas = option.borderAtlas,
+				shortage = entry.shortage,
+				availableTotal = entry.availableTotal,
+				selectedQualityOwnedCount = entry.selectedQualityOwnedCount,
+				otherQualityOwnedCount = entry.otherQualityOwnedCount,
+				totalOwnedCount = entry.totalOwnedCount,
+				unitPrice = option.unitPrice,
+				totalPrice = entry.totalPrice,
+				priceState = entry.priceState,
+				doNotBuy = self:IsDontBuyItem(option.itemID),
+				toggleDontBuy = true,
+			}
+		end
+	end
+
+	if order.concentration and order.concentration.currentCost and order.concentration.currencyID then
+		local currencyBasic = C_CurrencyInfo.GetBasicCurrencyInfo(order.concentration.currencyID, order.concentration.currentCost)
+		reagentIcons[#reagentIcons + 1] = {
+			currencyID = order.concentration.currencyID,
+			icon = currencyBasic and currencyBasic.icon,
+			count = order.concentration.currentCost,
+			alwaysShowCount = true,
+			borderAtlas = GetBorderAtlas(nil, currencyBasic and currencyBasic.quality),
+			leadingSpacer = #reagentIcons > 0,
+			availableTotal = order.concentration.available,
+			shortage = math.max(0, (order.concentration.currentCost or 0) - (order.concentration.available or 0)),
+			extraLines = BuildConcentrationExtraLines(order.concentration),
+		}
+	end
+
+	row.reagentLabel:Hide()
+	self:SetRowIcons(row, "reagentIcons", SELECT_WIDTH + PRODUCT_ICON_LEFT_OFFSET + PRODUCT_ICON_SIZE + PRODUCT_TEXT_GAP, ROW_ICON_Y_OFFSET, reagentIcons)
+
+	if #GetMaterialPlanEntries(order) == 0 then
+		row.costText:SetText(NONE)
+		row.costHint:SetText(L.COST_HINT_ALL_PROVIDED)
+	elseif (order.marketableMaterialEntryCount or 0) == 0 and (order.excludedMaterialEntryCount or 0) > 0 then
+		row.costText:SetText(NONE)
+		row.costHint:SetText(L.PRICE_NOT_MARKETABLE)
+	elseif order.materialCostKnown then
+		local costText = FormatListMoney(order.materialCost)
+		if not order.materialCostComplete then
+			costText = costText .. "*"
+		end
+		row.costText:SetText(costText)
+		row.costHint:SetText(order.materialCostComplete and L.COST_HINT_ALL_PRICED or L.COST_HINT_PARTIAL_PRICING)
+	else
+		row.costText:SetText(NONE)
+		row.costHint:SetText(L.PRICE_NO_MARKET_DATA)
+	end
+
+	row.rewardText:SetText(order.reward.gold > 0 and FormatListMoney(order.reward.gold) or NONE)
+	row.rewardValue:SetText("")
+
+	if order.profitKnown then
+		local profitText = FormatListMoney(order.profitValue or 0, true)
+		if not order.profitComplete then
+			profitText = profitText .. "*"
+		end
+		row.profitText:SetText(profitText)
+		if (order.profitValue or 0) < 0 then
+			row.profitText:SetTextColor(RED_FONT_COLOR.r, RED_FONT_COLOR.g, RED_FONT_COLOR.b)
+		else
+			row.profitText:SetTextColor(HIGHLIGHT_FONT_COLOR.r, HIGHLIGHT_FONT_COLOR.g, HIGHLIGHT_FONT_COLOR.b)
+		end
+	else
+		row.profitText:SetText(NONE)
+		row.profitText:SetTextColor(DISABLED_FONT_COLOR.r, DISABLED_FONT_COLOR.g, DISABLED_FONT_COLOR.b)
+	end
+
+	for _, icon in ipairs(order.reward.icons) do
+		if icon.itemID and not icon.icon then
+			icon.icon = select(5, C_Item.GetItemInfoInstant(icon.itemID))
+		end
+	end
+	self:SetRowIcons(row, "rewardIcons", SELECT_WIDTH + ORDER_WIDTH + COST_WIDTH + 8, ROW_ICON_Y_OFFSET, order.reward.icons)
+
+	local secondsRemaining = math.max(0, (order.expirationTime or 0) - C_CraftingOrders.GetCraftingOrderTime())
+	local red, green, blue = GetTimeColor(secondsRemaining)
+	row.timeLeft:SetText(FormatTimeRemaining(secondsRemaining))
+	row.timeLeft:SetTextColor(red, green, blue)
+end
+
+function Pane:RenderRows()
+	self.rowData = self.rowData or {}
+	wipe(self.rowData)
+	for index, order in ipairs(self.orders) do
+		self.rowData[index] = {
+			order = order,
+			index = index,
+		}
+	end
+
+	if self.orderDataProvider then
+		self.orderDataProvider:Flush()
+		if #self.rowData > 0 then
+			self.orderDataProvider:InsertTable(self.rowData)
+		end
+	end
+
+	self:UpdateScrollBox()
+	C_Timer.After(0, function()
+		if Pane and Pane.root and Pane.root:IsShown() then
+			Pane:UpdateScrollBox()
+		end
+	end)
 	self:UpdateEmptyState()
 	self:UpdateHeaderArrow()
 	self:UpdateToolbar()
@@ -3710,6 +4269,162 @@ local function IsRenderOnlyConfigKey(configKey)
 		or configKey == "dontBuyPerCharacter"
 end
 
+function Pane:GetRecipeFilterLabel(filterKey)
+	filterKey = NormalizeRecipeFilter(filterKey or self.recipeFilter)
+	if filterKey == RECIPE_FILTER_KNOWN then
+		return L.FILTER_RECIPE_KNOWN
+	elseif filterKey == RECIPE_FILTER_UNKNOWN then
+		return L.FILTER_RECIPE_UNKNOWN
+	end
+
+	return L.FILTER_RECIPE_ALL
+end
+
+function Pane:GetConcentrationFilterLabel(filterKey)
+	filterKey = NormalizeConcentrationFilter(filterKey or self.concentrationFilter)
+	if filterKey == CONCENTRATION_FILTER_NEEDS then
+		return L.FILTER_CONCENTRATION_NEEDS
+	elseif filterKey == CONCENTRATION_FILTER_NONE then
+		return L.FILTER_CONCENTRATION_NONE
+	end
+
+	return L.FILTER_CONCENTRATION_ALL
+end
+
+function Pane:HasActiveFilters()
+	return NormalizeRecipeFilter(self.recipeFilter) ~= RECIPE_FILTER_ALL
+		or NormalizeConcentrationFilter(self.concentrationFilter) ~= CONCENTRATION_FILTER_ALL
+end
+
+function Pane:DoesOrderMatchFilters(orderData)
+	if not orderData then
+		return false
+	end
+
+	local recipeFilter = NormalizeRecipeFilter(self.recipeFilter)
+	if recipeFilter == RECIPE_FILTER_KNOWN and not orderData.isKnown then
+		return false
+	elseif recipeFilter == RECIPE_FILTER_UNKNOWN and orderData.isKnown then
+		return false
+	end
+
+	local concentrationFilter = NormalizeConcentrationFilter(self.concentrationFilter)
+	local needsConcentration = DoesOrderNeedConcentration(orderData)
+	if concentrationFilter == CONCENTRATION_FILTER_NEEDS and not needsConcentration then
+		return false
+	elseif concentrationFilter == CONCENTRATION_FILTER_NONE and needsConcentration then
+		return false
+	end
+
+	return true
+end
+
+function Pane:ApplyOrderFilters()
+	local filteredOrders = {}
+	for _, order in ipairs(self.allOrders or EMPTY_LIST) do
+		if self:DoesOrderMatchFilters(order) then
+			filteredOrders[#filteredOrders + 1] = order
+		end
+	end
+
+	self.orders = filteredOrders
+end
+
+function Pane:SetRecipeFilter(filterKey)
+	filterKey = NormalizeRecipeFilter(filterKey)
+	local db = ns.GetDatabase and ns.GetDatabase()
+	if type(db) == "table" then
+		db.patronRecipeFilter = filterKey
+	end
+
+	if self.recipeFilter == filterKey then
+		self:UpdateFilterPanel()
+		return
+	end
+
+	self.recipeFilter = filterKey
+	self:UpdateFilterPanel()
+	self:MarkDirty("filter")
+end
+
+function Pane:SetConcentrationFilter(filterKey)
+	filterKey = NormalizeConcentrationFilter(filterKey)
+	local db = ns.GetDatabase and ns.GetDatabase()
+	if type(db) == "table" then
+		db.patronConcentrationFilter = filterKey
+	end
+
+	if self.concentrationFilter == filterKey then
+		self:UpdateFilterPanel()
+		return
+	end
+
+	self.concentrationFilter = filterKey
+	self:UpdateFilterPanel()
+	self:MarkDirty("filter")
+end
+
+function Pane:SetSort(sortKey, sortAscending)
+	sortKey = NormalizeSortKey(sortKey)
+	sortAscending = sortAscending == true
+	local db = ns.GetDatabase and ns.GetDatabase()
+	if type(db) == "table" then
+		db.patronSortKey = sortKey
+		db.patronSortAscending = sortAscending
+	end
+
+	if self.sortKey == sortKey and self.sortAscending == sortAscending then
+		self:UpdateHeaderArrow()
+		return
+	end
+
+	self.sortKey = sortKey
+	self.sortAscending = sortAscending
+	self:MarkDirty("sort")
+end
+
+function Pane:LoadSavedFilters()
+	self.recipeFilter = NormalizeRecipeFilter(ns.GetConfig and ns.GetConfig("patronRecipeFilter") or self.recipeFilter)
+	self.concentrationFilter = NormalizeConcentrationFilter(ns.GetConfig and ns.GetConfig("patronConcentrationFilter") or self.concentrationFilter)
+	self:UpdateFilterPanel()
+end
+
+function Pane:LoadSavedSort()
+	self.sortKey = NormalizeSortKey(ns.GetConfig and ns.GetConfig("patronSortKey") or self.sortKey)
+	self.sortAscending = (ns.GetConfig and ns.GetConfig("patronSortAscending")) == true
+	self:UpdateHeaderArrow()
+end
+
+function Pane:UpdateFilterPanel()
+	if not self.filterPanel then
+		return
+	end
+
+	if self.recipeFilterButtons then
+		local recipeFilter = NormalizeRecipeFilter(self.recipeFilter)
+		SetFilterMenuToggleChecked(self.recipeFilterButtons[RECIPE_FILTER_KNOWN], recipeFilter == RECIPE_FILTER_KNOWN)
+	end
+
+	if self.concentrationFilterButtons then
+		local concentrationFilter = NormalizeConcentrationFilter(self.concentrationFilter)
+		SetFilterMenuToggleChecked(self.concentrationFilterButtons[CONCENTRATION_FILTER_NONE], concentrationFilter == CONCENTRATION_FILTER_NONE)
+	end
+end
+
+function Pane:ToggleFilterPanel()
+	if not self.filterPanel then
+		return
+	end
+
+	if self.filterPanel:IsShown() then
+		self.filterPanel:Hide()
+		return
+	end
+
+	self:UpdateFilterPanel()
+	self.filterPanel:Show()
+end
+
 local function GetReasonPriority(reason)
 	if reason == "show" or reason == "order-type" or reason == "can-request" or reason == "request-timeout" or reason == "request-success" then
 		return 3
@@ -3720,16 +4435,17 @@ local function GetReasonPriority(reason)
 	if GetConfigKeyFromReason(reason) then
 		return 2
 	end
-	if reason == "sort" then
+	if reason == "sort" or reason == "filter" then
 		return 1
 	end
 	return 0
 end
 
 function Pane:HasVisibleOrdersForProfession(profession)
+	local orders = self.allOrders or self.orders or EMPTY_LIST
 	return profession ~= nil
 		and self.ordersProfession == profession
-		and #(self.orders or EMPTY_LIST) > 0
+		and #orders > 0
 end
 
 function Pane:HasSuccessfulRequestForVisibleSession(profession)
@@ -3754,7 +4470,7 @@ end
 
 function Pane:PruneSelectedOrders()
 	local validSelection = {}
-	for _, order in ipairs(self.orders or EMPTY_LIST) do
+	for _, order in ipairs(self.allOrders or self.orders or EMPTY_LIST) do
 		if self.selectedOrderIDs[order.orderID] then
 			validSelection[order.orderID] = true
 		end
@@ -3764,6 +4480,7 @@ function Pane:PruneSelectedOrders()
 end
 
 function Pane:ClearVisibleOrders(profession)
+	self.allOrders = {}
 	self.orders = {}
 	self.ordersProfession = profession
 	self.ordersGeneration = self.rebuildGeneration or 0
@@ -3793,6 +4510,8 @@ function Pane:SetVisibleProfession(profession)
 end
 
 function Pane:BeginVisibleSession()
+	self:LoadSavedFilters()
+	self:LoadSavedSort()
 	self.visibleSessionId = (self.visibleSessionId or 0) + 1
 	self.requestSettleUntil = nil
 	self.requestReadinessRetryCount = 0
@@ -3864,10 +4583,15 @@ function Pane:UpdateEmptyState()
 		return
 	end
 
-	local hasOrders = #(self.orders or {}) > 0
+	local hasOrders = #(self.orders or EMPTY_LIST) > 0
+	local hasPreparedOrders = #(self.allOrders or EMPTY_LIST) > 0
 	local isLoading = not hasOrders and self:IsLoadingOrders()
+	local emptyText = EMPTY_STATE_EMPTY_TEXT
+	if not isLoading and not hasOrders and hasPreparedOrders and self:HasActiveFilters() then
+		emptyText = EMPTY_STATE_FILTERED_TEXT
+	end
 
-	self.noOrders:SetText(isLoading and EMPTY_STATE_LOADING_TEXT or EMPTY_STATE_EMPTY_TEXT)
+	self.noOrders:SetText(isLoading and EMPTY_STATE_LOADING_TEXT or emptyText)
 	if isLoading then
 		self.noOrders:SetTextColor(NORMAL_FONT_COLOR.r, NORMAL_FONT_COLOR.g, NORMAL_FONT_COLOR.b)
 	else
@@ -3893,7 +4617,7 @@ function Pane:MarkDirty(reason)
 		professionChanged = self:SetVisibleProfession(currentProfession)
 	end
 
-	if reason == "sort" then
+	if reason == "sort" or reason == "filter" then
 		self.needsRender = true
 	elseif reason == "show" or reason == "order-type" or reason == "can-request" or reason == "request-timeout" then
 		if currentProfession == nil or self:ShouldQueueOpenRequest(currentProfession) then
@@ -4070,7 +4794,7 @@ function Pane:RebuildPreparedOrders()
 	if preserveVisibleCache then
 		local hasUnresolvedItemData = false
 		local unresolvedItemIDs = {}
-		for _, order in ipairs(self.orders or EMPTY_LIST) do
+		for _, order in ipairs(self.allOrders or self.orders or EMPTY_LIST) do
 			if order.hasUnresolvedItemData then
 				hasUnresolvedItemData = true
 				for itemID in pairs(order.unresolvedItemIDs or EMPTY_LIST) do
@@ -4120,7 +4844,8 @@ function Pane:RebuildPreparedOrders()
 	end
 
 	self.preparedOrderCache = preparedOrderCache
-	self.orders = preparedOrders
+	self.allOrders = preparedOrders
+	self:ApplyOrderFilters()
 	self.ordersProfession = currentProfession
 	self.ordersGeneration = self.rebuildGeneration
 	self.hasUnresolvedItemData = hasUnresolvedItemData
@@ -4148,6 +4873,7 @@ function Pane:ProcessPendingRefresh()
 
 	if self.needsRender then
 		self.needsRender = false
+		self:ApplyOrderFilters()
 		self:SortPreparedOrders()
 		self:RenderRows()
 	else
@@ -4169,6 +4895,9 @@ function Pane:SetCustomPaneShown(isShown)
 	if isShown then
 		self:ApplyReferenceLayout()
 	else
+		if self.filterPanel then
+			self.filterPanel:Hide()
+		end
 		self:ClearRequestState()
 		self.pendingReason = nil
 		self.pendingDueAt = nil
@@ -4397,6 +5126,9 @@ function Pane:Initialize()
 	if self.initialized then
 		return
 	end
+
+	self:LoadSavedFilters()
+	self:LoadSavedSort()
 
 	if not self:BuildFrame() then
 		self:ScheduleInitializeRetry()
