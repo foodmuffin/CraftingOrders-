@@ -53,7 +53,7 @@ local FILTER_BUTTON_HEIGHT = HEADER_HEIGHT
 local FILTER_BUTTON_RIGHT_OFFSET = -2
 local FILTER_BUTTON_TOP_OFFSET = HEADER_TOP_OFFSET
 local FILTER_PANEL_WIDTH = 188
-local FILTER_PANEL_HEIGHT = 122
+local FILTER_PANEL_HEIGHT = 172
 local REQUEST_COOLDOWN = 0.75
 local REQUEST_TIMEOUT = 12
 local REQUEST_SETTLE_DELAY = 0.25
@@ -1375,6 +1375,13 @@ local function BuildMaterialEntry(slotData, option, quantity)
 end
 
 local EMPTY_LIST = {}
+
+-- Tracks shopping lists this addon has created since the last login/reload. Stored
+-- as fields on Pane (not top-level locals) because Lua 5.1 caps a chunk's main
+-- function at 200 locals and this file already sits close to that ceiling; Pane
+-- itself is a single existing local, so hanging state off it costs nothing extra.
+-- Resets naturally every login/reload since the whole chunk re-executes then.
+Pane._sessionShoppingLists = {}
 
 local function GetMaterialPlanEntries(orderData)
 	local materialPlan = orderData and orderData.materialPlan
@@ -3635,6 +3642,12 @@ function Pane:UpdateToolbar()
 	end
 	self.createListButton:SetEnabled(selectedCount > 0 and provider ~= nil)
 
+	if self.selectAllButton then
+		local allSelected = self:AreAllVisibleOrdersSelected()
+		self.selectAllButton:SetText(allSelected and L.TOOLBAR_DESELECT_ALL or L.TOOLBAR_SELECT_ALL)
+		self.selectAllButton:SetEnabled(#(self.orders or EMPTY_LIST) > 0)
+	end
+
 	if self.filterButton then
 		SetFallbackFilterButtonLabel(self.filterButton, L.TOOLBAR_FILTER_BUTTON)
 		self.filterButton.tooltipTitle = L.TOOLBAR_FILTER_MENU
@@ -3710,6 +3723,146 @@ function Pane:CollectShoppingEntries()
 	return export, selectedOrders, skippedEntries
 end
 
+function Pane._MergeShoppingEntry(store, entry)
+	local key = GetShoppingEntryGroupKey(entry)
+	local existing = store[key]
+	if existing then
+		existing.quantity = (existing.quantity or 0) + (entry.quantity or 0)
+		if LinkHasDisplayName(entry.itemLink) and not LinkHasDisplayName(existing.itemLink) then
+			existing.itemLink = entry.itemLink
+			existing.itemIdentity = entry.itemIdentity
+		end
+	else
+		local copy = {}
+		for field, value in pairs(entry) do
+			copy[field] = value
+		end
+		store[key] = copy
+	end
+end
+
+function Pane._StoreSessionShoppingEntries(listName, entries)
+	local store = Pane._sessionShoppingLists[listName] or {}
+	for _, entry in ipairs(entries) do
+		Pane._MergeShoppingEntry(store, entry)
+	end
+	Pane._sessionShoppingLists[listName] = store
+	Pane._lastSessionListName = listName
+	return store
+end
+
+function Pane._FlattenSessionShoppingList(listName)
+	local flat = {}
+	local store = Pane._sessionShoppingLists[listName]
+	if not store then
+		return flat
+	end
+
+	for _, entry in pairs(store) do
+		flat[#flat + 1] = entry
+	end
+
+	table.sort(flat, function(left, right)
+		return (left.name or UNKNOWN) < (right.name or UNKNOWN)
+	end)
+
+	return flat
+end
+
+function Pane._GenerateNewSessionListName()
+	local base = LF("SHOPPING_LIST_NAME_FORMAT", Util.GetLocalTimeStamp())
+	if not Pane._sessionShoppingLists[base] then
+		return base
+	end
+
+	-- Same-minute collision (GetLocalTimeStamp only has minute resolution): disambiguate
+	-- instead of silently reusing/overwriting an unrelated list that happens to share a name.
+	local suffix = 2
+	while Pane._sessionShoppingLists[base .. " (" .. suffix .. ")"] do
+		suffix = suffix + 1
+	end
+	return base .. " (" .. suffix .. ")"
+end
+
+StaticPopupDialogs["CRAFTINGORDERSPP_MERGE_SHOPPING_LIST"] = {
+	text = L.POPUP_MERGE_SHOPPING_LIST_TEXT,
+	button1 = L.POPUP_MERGE_BUTTON,
+	button2 = L.POPUP_NEW_LIST_BUTTON,
+	button3 = CANCEL,
+	OnAccept = function(_, data)
+		if data and data.entries then
+			Pane:FinalizeShoppingList("merge", data.entries)
+		end
+	end,
+	OnCancel = function(_, data, reason)
+		-- OnCancel also fires on timeout/escape; only button2 ("New List") should act.
+		if reason == "clicked" and data and data.entries then
+			Pane:FinalizeShoppingList("new", data.entries)
+		end
+	end,
+	timeout = 0,
+	whileDead = true,
+	hideOnEscape = true,
+}
+
+function Pane:FinalizeShoppingList(mode, entries)
+	local listName
+	if mode == "merge" and Pane._lastSessionListName and Pane._sessionShoppingLists[Pane._lastSessionListName] then
+		listName = Pane._lastSessionListName
+	else
+		Pane._CleanupStaleShoppingList()
+		listName = Pane._GenerateNewSessionListName()
+	end
+
+	Pane._StoreSessionShoppingEntries(listName, entries)
+	ns.SetConfig("lastShoppingListName", listName)
+
+	local exportEntries = Pane._FlattenSessionShoppingList(listName)
+	local ok, message = Pricing:ExportShoppingList(exportEntries, listName)
+	ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+end
+
+-- Auctioneer's Snatch export (Pricing:CreateAuctioneerSnatchList) has no concept of
+-- named/multiple lists at all -- it just adds snipes -- so the merge prompt only
+-- makes sense (and only ever triggered the original overwrite bug) for Auctionator.
+function Pane._ProviderSupportsMerge()
+	local provider = Pricing:GetActiveProvider()
+	return provider ~= nil and provider.key == "auctionator"
+end
+
+-- The in-memory session tracking above (_sessionShoppingLists) resets every login as
+-- intended, but the Auctionator list it created is real account-wide SavedVariables
+-- data that otherwise lives forever -- so leftover lists from past characters/sessions
+-- pile up in Auctionator. lastShoppingListName is the one persisted breadcrumb (in our
+-- own SavedVariables, set in FinalizeShoppingList) pointing at the most recent list we
+-- made; the first "new" list of a fresh login deletes whatever it points to, then this
+-- runs at most once per login (_staleListCleanupDone) so intentional same-session "New
+-- List" clicks later on never get treated as stale.
+function Pane._CleanupStaleShoppingList()
+	if Pane._staleListCleanupDone or not Pane._ProviderSupportsMerge() then
+		return
+	end
+	Pane._staleListCleanupDone = true
+
+	local staleName = ns.GetConfig("lastShoppingListName")
+	if not staleName or staleName == "" then
+		return
+	end
+
+	local manager = Auctionator and Auctionator.Shopping and Auctionator.Shopping.ListManager
+	if not (manager and type(manager.GetIndexForName) == "function" and type(manager.Delete) == "function") then
+		return
+	end
+
+	if manager:GetIndexForName(staleName) then
+		if pcall(manager.Delete, manager, staleName) then
+			ns.Print(LF("MSG_STALE_SHOPPING_LIST_CLEARED_FORMAT", staleName))
+		end
+	end
+
+	ns.SetConfig("lastShoppingListName", nil)
+end
+
 function Pane:CreateShoppingList()
 	local entries, selectedCount, skippedEntries = self:CollectShoppingEntries()
 	if selectedCount == 0 then
@@ -3726,9 +3879,63 @@ function Pane:CreateShoppingList()
 		return
 	end
 
-	local listName = LF("SHOPPING_LIST_NAME_FORMAT", Util.GetLocalTimeStamp())
-	local ok, message = Pricing:ExportShoppingList(entries, listName)
-	ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+	if Pane._ProviderSupportsMerge() and Pane._lastSessionListName and Pane._sessionShoppingLists[Pane._lastSessionListName] then
+		StaticPopup_Show("CRAFTINGORDERSPP_MERGE_SHOPPING_LIST", Pane._lastSessionListName, #entries, { entries = entries })
+	else
+		self:FinalizeShoppingList("new", entries)
+	end
+end
+
+function Pane:ResetSessionShoppingLists()
+	if not Pane._lastSessionListName then
+		ns.Print(L.MSG_NO_SESSION_SHOPPING_LIST)
+		return
+	end
+
+	wipe(Pane._sessionShoppingLists)
+	Pane._lastSessionListName = nil
+	ns.Print(L.MSG_SESSION_SHOPPING_LIST_RESET)
+end
+
+function Pane:AreAllVisibleOrdersSelected()
+	local orders = self.orders or EMPTY_LIST
+	if #orders == 0 then
+		return false
+	end
+
+	for _, order in ipairs(orders) do
+		if not self.selectedOrderIDs[order.orderID] then
+			return false
+		end
+	end
+	return true
+end
+
+function Pane:ToggleSelectAll()
+	local orders = self.orders or EMPTY_LIST
+	if #orders == 0 then
+		return
+	end
+
+	local selectAll = not self:AreAllVisibleOrdersSelected()
+	for _, order in ipairs(orders) do
+		self.selectedOrderIDs[order.orderID] = selectAll or nil
+	end
+
+	-- FullUpdate's dirty-tracking may skip re-initializing rows that are already
+	-- visible and whose underlying element data hasn't changed, so the checkboxes
+	-- wouldn't visually flip even though selectedOrderIDs is correct. Force every
+	-- pooled row frame's checkbox directly instead of trusting that.
+	if self.rows then
+		for _, row in ipairs(self.rows) do
+			if row.checkbox and row.order then
+				row.checkbox:SetChecked(not not self.selectedOrderIDs[row.order.orderID])
+			end
+		end
+	end
+
+	self:UpdateScrollBox()
+	self:UpdateToolbar()
 end
 
 function Pane:ApplyReferenceLayout()
@@ -3785,13 +3992,24 @@ function Pane:BuildFrame()
 	self.createListButton:SetNormalFontObject(GameFontNormalSmall)
 	self.createListButton:SetHighlightFontObject(GameFontHighlightSmall)
 	self.createListButton:SetMotionScriptsWhileDisabled(true)
-	self.createListButton:SetScript("OnClick", function()
-		Pane:CreateShoppingList()
+	self.createListButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	self.createListButton:SetScript("OnClick", function(_, button)
+		if button == "RightButton" then
+			Pane:ResetSessionShoppingLists()
+		else
+			Pane:CreateShoppingList()
+		end
 	end)
 	self.createListButton:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 		GameTooltip:SetText(self.tooltipTitle or L.TOOLBAR_CREATE_SHOPPING_LIST)
 		GameTooltip:AddLine(self.tooltipText or L.TOOLBAR_SELECT_ORDERS_TOOLTIP, 1, 1, 1, true)
+		local activeProvider = Pricing:GetActiveProvider()
+		if Pane._lastSessionListName and activeProvider and activeProvider.key == "auctionator" then
+			GameTooltip:AddLine(" ")
+			GameTooltip:AddLine(LF("TOOLBAR_WILL_MERGE_INTO_FORMAT", Pane._lastSessionListName), 0.6, 0.8, 1, true)
+			GameTooltip:AddLine(L.TOOLBAR_RIGHTCLICK_RESET_HINT, 0.7, 0.7, 0.7, true)
+		end
 		GameTooltip:Show()
 	end)
 	self.createListButton:SetScript("OnLeave", GameTooltip_Hide)
@@ -3868,6 +4086,32 @@ function Pane:BuildFrame()
 	self.concentrationFilterButtons[CONCENTRATION_FILTER_NONE]:SetScript("OnClick", function()
 		Pane:SetConcentrationFilter(Pane.concentrationFilter == CONCENTRATION_FILTER_NONE and CONCENTRATION_FILTER_ALL or CONCENTRATION_FILTER_NONE)
 	end)
+
+	-- Lives in the filter dropdown rather than the main toolbar: that row (checkbox
+	-- column + 5 headers + filter button) is already packed edge to edge with no
+	-- spare pixels, so a wider button there overlaps the column headers and the tab bar.
+	self.filterPanel.selectAllHeader = self.filterPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	self.filterPanel.selectAllHeader:SetPoint("TOPLEFT", self.concentrationFilterButtons[CONCENTRATION_FILTER_NONE], "BOTTOMLEFT", 2, -12)
+	self.filterPanel.selectAllHeader:SetWidth(FILTER_PANEL_WIDTH - 28)
+	self.filterPanel.selectAllHeader:SetJustifyH("LEFT")
+	self.filterPanel.selectAllHeader:SetText(L.FILTER_BULK_SELECT_HEADER)
+
+	self.selectAllButton = CreateFrame("Button", nil, self.filterPanel, "UIPanelButtonTemplate")
+	self.selectAllButton:SetPoint("TOPLEFT", self.filterPanel.selectAllHeader, "BOTTOMLEFT", -2, -6)
+	self.selectAllButton:SetSize(FILTER_PANEL_WIDTH - 24, 20)
+	self.selectAllButton:SetNormalFontObject(GameFontNormalSmall)
+	self.selectAllButton:SetHighlightFontObject(GameFontHighlightSmall)
+	self.selectAllButton:SetText(L.TOOLBAR_SELECT_ALL)
+	self.selectAllButton:SetScript("OnClick", function()
+		Pane:ToggleSelectAll()
+	end)
+	self.selectAllButton:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(self.tooltipTitle or L.TOOLBAR_SELECT_ALL)
+		GameTooltip:AddLine(self.tooltipText or L.TOOLBAR_SELECT_ALL_TOOLTIP, 1, 1, 1, true)
+		GameTooltip:Show()
+	end)
+	self.selectAllButton:SetScript("OnLeave", GameTooltip_Hide)
 
 	self.headers = {
 		order = CreateHeaderButton(root, L.HEADER_YOU_CRAFT_SUPPLY, "order", ORDER_WIDTH, SELECT_WIDTH + 2),
