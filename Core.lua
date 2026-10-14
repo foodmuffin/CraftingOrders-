@@ -88,7 +88,7 @@ local function GetItemLink(item)
 	if type(item) == "string" and item ~= "" then
 		return item
 	elseif type(item) == "number" and item > 0 then
-		return select(2, GetItemInfo(item))
+		return select(2, C_Item.GetItemInfo(item))
 	end
 end
 
@@ -97,11 +97,11 @@ local function GetItemName(item)
 		local itemID = tonumber(item:match("item:(%d+)"))
 		local itemName
 		if itemID then
-			itemName = GetItemInfo(itemID)
+			itemName = C_Item.GetItemInfo(itemID)
 		end
 		return itemName or item:match("%[(.-)%]")
 	elseif type(item) == "number" and item > 0 then
-		return GetItemInfo(item)
+		return C_Item.GetItemInfo(item)
 	end
 end
 
@@ -216,7 +216,7 @@ local function GetItemBindType(item)
 		return nil
 	end
 
-	return select(14, GetItemInfo(item))
+	return select(14, C_Item.GetItemInfo(item))
 end
 
 local function IsItemMarketable(item)

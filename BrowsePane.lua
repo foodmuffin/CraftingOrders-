@@ -509,7 +509,7 @@ end
 local function GetBorderAtlas(itemID, quality)
 	local itemQuality = quality
 	if itemQuality == nil and itemID then
-		itemQuality = select(3, GetItemInfo(itemID))
+		itemQuality = select(3, C_Item.GetItemInfo(itemID))
 	end
 	return BORDER_BY_ITEM_QUALITY[itemQuality or 1] or BORDER_BY_ITEM_QUALITY[1]
 end
