@@ -22,6 +22,7 @@ local defaults = {
 	warnExpensiveIngredients = true,
 	expensiveIngredientThresholdPercent = 10,
 	greyUnknownRecipes = true,
+	temporaryShoppingLists = false,
 	showRewardValue = true,
 	showSilverCopperInList = false,
 	patronRecipeFilter = "all",

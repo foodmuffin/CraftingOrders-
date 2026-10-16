@@ -22,6 +22,8 @@ ns.AddLocale("enUS", {
 	OPTION_OPENING_HINT = "Only affects patron orders opened from the Crafting Orders++ patron list.",
 	OPTION_DONT_BUY_PER_CHARACTER = "Keep Don't Buy ingredient list per character",
 	OPTION_DONT_BUY_HINT = "When unchecked, the Don't Buy ingredient list is shared across all characters.",
+	OPTION_TEMPORARY_SHOPPING_LISTS = "Create Auctionator shopping lists as temporary",
+	OPTION_TEMPORARY_SHOPPING_LISTS_HINT = "When checked, Auctionator shopping lists are created as temporary, which are cleared on relog or reload.",
 	OPTION_FOOTER_HINT = "Shopping-list export follows the selected pricing addon. Auctionator creates shopping lists, while Auctioneer exports to Snatch when it is available.",
 	OPTION_PRICING_FOOTER_AUCTIONEER = "Auctioneer is used for pricing. Shopping export goes to Snatch when that module is available.",
 	OPTION_PRICING_FOOTER_AUCTIONATOR = "Auctionator is used for pricing and shopping-list creation.",

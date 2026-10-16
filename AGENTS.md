@@ -298,6 +298,7 @@ Only one pricing provider is selected at a time.
 ### Export behavior
 
 - Auctionator export creates a shopping list.
+  When `temporaryShoppingLists` is on (off by default), the list is flagged temporary so Auctionator prunes it on the next relog/reload.
 - Auctioneer export adds entries to Snatch.
 - Export feedback in chat should include:
   - quantity added
@@ -317,6 +318,7 @@ Current meaningful settings include:
 - `expensiveIngredientThresholdPercent`
 - `greyUnknownRecipes`
 - `showSilverCopperInList`
+- `temporaryShoppingLists`
 
 Rules:
 

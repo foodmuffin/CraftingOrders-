@@ -324,6 +324,26 @@ function Pricing:GetTotalPrice(item, count)
 	return priceInfo.totalPrice, priceInfo.providerKey, priceInfo.unitPrice, priceInfo.state
 end
 
+local function MarkAuctionatorListTemporary(listName)
+	local manager = Auctionator and Auctionator.Shopping and Auctionator.Shopping.ListManager
+	if not (manager and type(manager.GetIndexForName) == "function" and type(manager.GetByIndex) == "function") then
+		return
+	end
+
+	pcall(function()
+		local index = manager:GetIndexForName(listName)
+		local list = index and manager:GetByIndex(index)
+		if not (list and type(list.data) == "table") then
+			return
+		end
+
+		list.data.isTemporary = true
+		if type(manager.FireMetaChangeEvent) == "function" then
+			manager:FireMetaChangeEvent(listName)
+		end
+	end)
+end
+
 function Pricing:CreateAuctionatorShoppingList(entries, listName)
 	local api = Auctionator and Auctionator.API and Auctionator.API.v1
 	if not (api and type(api.ConvertToSearchString) == "function" and type(api.CreateShoppingList) == "function") then
@@ -366,6 +386,10 @@ function Pricing:CreateAuctionatorShoppingList(entries, listName)
 	local ok, errorMessage = pcall(api.CreateShoppingList, ns.CALLER_ID, listName, searchStrings)
 	if not ok then
 		return false, errorMessage
+	end
+
+	if ns.GetConfig("temporaryShoppingLists") == true then
+		MarkAuctionatorListTemporary(listName)
 	end
 
 	return true, LF("MSG_CREATED_AUCTIONATOR_LIST", listName, FormatShoppingSummary(BuildShoppingSummary(exportedEntries)))
