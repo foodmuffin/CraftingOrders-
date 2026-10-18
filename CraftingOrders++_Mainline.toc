@@ -1,4 +1,4 @@
-## Interface: 120005
+## Interface: 120105
 ## Title: Crafting Orders++
 ## Author: @project-author@
 ## Version: @project-version@
@@ -23,4 +23,5 @@ Locales\zhTW.lua
 Core.lua
 Pricing.lua
 Options.lua
+WorkQueue.lua
 BrowsePane.lua

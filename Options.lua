@@ -388,12 +388,37 @@ function Options:BuildPanel()
 		620
 	)
 
+	panel.temporaryShoppingLists = CreateCheckButton(
+		panel,
+		L.OPTION_TEMPORARY_SHOPPING_LISTS,
+		"TOPLEFT",
+		panel.dontBuyScopeHint,
+		"BOTTOMLEFT",
+		-4,
+		-18,
+		function(self)
+			ns.SetConfig("temporaryShoppingLists", self:GetChecked())
+		end
+	)
+
+	panel.temporaryShoppingListsHint = CreateLabel(
+		panel,
+		"GameFontHighlightSmall",
+		L.OPTION_TEMPORARY_SHOPPING_LISTS_HINT,
+		"TOPLEFT",
+		panel.temporaryShoppingLists,
+		"BOTTOMLEFT",
+		4,
+		-2,
+		620
+	)
+
 	panel.footer = CreateLabel(
 		panel,
 		"GameFontHighlightSmall",
 		L.OPTION_FOOTER_HINT,
 		"TOPLEFT",
-		panel.dontBuyScopeHint,
+		panel.temporaryShoppingListsHint,
 		"BOTTOMLEFT",
 		0,
 		-18,
@@ -422,6 +447,8 @@ function Options:BuildPanel()
 		panel.openBehaviorHint,
 		panel.dontBuyPerCharacter,
 		panel.dontBuyScopeHint,
+		panel.temporaryShoppingLists,
+		panel.temporaryShoppingListsHint,
 		panel.footer,
 	}
 
@@ -510,6 +537,7 @@ function Options:Refresh()
 	self.panel.openBehaviorNone:SetChecked(db.openPatronOrderBehavior ~= "apply_plan")
 	self.panel.openBehaviorApplyPlan:SetChecked(db.openPatronOrderBehavior == "apply_plan")
 	self.panel.dontBuyPerCharacter:SetChecked(db.dontBuyPerCharacter)
+	self.panel.temporaryShoppingLists:SetChecked(db.temporaryShoppingLists == true)
 	self:QueueScrollLayoutUpdate()
 end
 

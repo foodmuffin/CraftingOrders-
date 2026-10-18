@@ -6,6 +6,7 @@ local Pane = ns.BrowsePane
 local Pricing = ns.Pricing
 local Util = ns.Util
 local L = ns.L
+local PreparationWork = ns.PreparationWork
 
 local function LF(key, ...)
 	if ns.LF then
@@ -53,7 +54,7 @@ local FILTER_BUTTON_HEIGHT = HEADER_HEIGHT
 local FILTER_BUTTON_RIGHT_OFFSET = -2
 local FILTER_BUTTON_TOP_OFFSET = HEADER_TOP_OFFSET
 local FILTER_PANEL_WIDTH = 188
-local FILTER_PANEL_HEIGHT = 122
+local FILTER_PANEL_HEIGHT = 172
 local REQUEST_COOLDOWN = 0.75
 local REQUEST_TIMEOUT = 12
 local REQUEST_SETTLE_DELAY = 0.25
@@ -509,7 +510,7 @@ end
 local function GetBorderAtlas(itemID, quality)
 	local itemQuality = quality
 	if itemQuality == nil and itemID then
-		itemQuality = select(3, GetItemInfo(itemID))
+		itemQuality = select(3, C_Item.GetItemInfo(itemID))
 	end
 	return BORDER_BY_ITEM_QUALITY[itemQuality or 1] or BORDER_BY_ITEM_QUALITY[1]
 end
@@ -1017,6 +1018,7 @@ local function GetRecipeSchematic(recipeInfo)
 end
 
 local function GetOperationInfo(orderData, reagents, applyConcentration)
+	PreparationWork:Checkpoint()
 	if not (orderData and orderData.recipeInfo and orderData.recipeInfo.recipeID and C_TradeSkillUI) then
 		return nil
 	end
@@ -1376,6 +1378,13 @@ end
 
 local EMPTY_LIST = {}
 
+-- Tracks shopping lists this addon has created since the last login/reload. Stored
+-- as fields on Pane (not top-level locals) because Lua 5.1 caps a chunk's main
+-- function at 200 locals and this file already sits close to that ceiling; Pane
+-- itself is a single existing local, so hanging state off it costs nothing extra.
+-- Resets naturally every login/reload since the whole chunk re-executes then.
+Pane._sessionShoppingLists = {}
+
 local function GetMaterialPlanEntries(orderData)
 	local materialPlan = orderData and orderData.materialPlan
 	return materialPlan and materialPlan.entries or EMPTY_LIST
@@ -1499,6 +1508,7 @@ local function BuildSlotFillVariants(slotData, allowEmpty)
 
 	local components = {}
 	local function Visit(optionIndex, remaining)
+		PreparationWork:Checkpoint()
 		local option = options[optionIndex]
 		if remaining == 0 then
 			variants[#variants + 1] = CreateMaterialVariant(slotData, components)
@@ -1536,7 +1546,7 @@ local function BuildSlotFillVariants(slotData, allowEmpty)
 	end
 
 	Visit(1, slotData.quantityRequired or 0)
-	table.sort(variants, CompareMaterialPlanPreference)
+	PreparationWork:Sort(variants, CompareMaterialPlanPreference)
 	return variants
 end
 
@@ -1621,9 +1631,17 @@ local function BuildLowestMaterialPlan(orderData)
 
 	for _, slotData in ipairs(orderData.mutableSlots or {}) do
 		if slotData.dataSlotType == MUTABLE_SLOT_TYPE and not slotData.covered and not slotData.locked and slotData.required then
-			local variants = BuildSlotFillVariants(slotData, false)
-			if variants[1] then
-				selections[#selections + 1] = variants[1]
+			-- The lowest plan has no quality constraint: its objective is linear
+			-- in quantity. A mixture cannot beat the best single-option fill.
+			-- Avoid enumerating every distribution just to take the first one.
+			local best
+			for _, option in ipairs(slotData.options or EMPTY_LIST) do
+				PreparationWork:Checkpoint()
+				local candidate = CreateMaterialVariant(slotData, {{option = option, quantity = slotData.quantityRequired}})
+				if not best or CompareMaterialPlanPreference(candidate, best) then best = candidate end
+			end
+			if best then
+				selections[#selections + 1] = best
 			else
 				missingRequiredSlots = missingRequiredSlots + 1
 			end
@@ -1676,6 +1694,7 @@ local function FindReachableMaterialPlan(orderData, requiredQuality)
 	local selections = {}
 
 	local function Search(slotIndex, currentQualityWeight)
+		PreparationWork:Checkpoint()
 		if slotIndex > #planningSlots then
 			local candidate = BuildPlannedMaterialCombination(orderData, selections, 0)
 			if CanReachRequiredQuality(candidate.operationInfo, requiredQuality)
@@ -2095,7 +2114,7 @@ local function EstimateConcentrationCost(orderData, inventoryOnly, preferHighSco
 	return operationInfo.concentrationCost or 0, operationInfo
 end
 
-local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedReagents)
+local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedReagents, warningsOnly)
 	local coveredSlots = {}
 	for _, suppliedReagent in ipairs(suppliedReagents or EMPTY_LIST) do
 		if suppliedReagent.slotIndex then
@@ -2114,6 +2133,7 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 	local slotMap = {}
 
 	for _, slot in ipairs(reagentSlotSchematics or EMPTY_LIST) do
+		PreparationWork:Checkpoint()
 		local slotData = {
 			slotIndex = slot.slotIndex,
 			dataSlotType = slot.dataSlotType,
@@ -2129,6 +2149,7 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 
 		if not slotData.covered then
 			for _, reagent in ipairs(slot.reagents or {}) do
+				PreparationWork:Checkpoint()
 				if reagent.itemID then
 					local itemLink = reagent.itemLink or reagent.hyperlink or Util.GetItemLink(reagent.itemID)
 					local itemIdentity = GetReagentItemIdentity(reagent.itemID, itemLink)
@@ -2185,6 +2206,9 @@ local function BuildRequiredReagents(orderData, reagentSlotSchematics, suppliedR
 	orderData.mutableSlots = mutableSlots
 	orderData.staticMaterialEntries = staticMaterialEntries
 	orderData.staticMissingRequiredSlots = staticMissingRequiredSlots
+	-- Price warnings only need the slot options. Do not run quality searches,
+	-- concentration simulations or material-plan generation on every item event.
+	if warningsOnly then return end
 	orderData.operationReagents, orderData.baseOperation = CreateOperationContext(orderData, suppliedReagents)
 
 	for _, slotData in ipairs(mutableSlots) do
@@ -2339,7 +2363,7 @@ local function CollectUnresolvedItemIDs(orderData)
 		TrackUnresolvedItemID(unresolvedItemIDs, rewardIcon.itemID)
 	end
 
-	for _, slotData in ipairs(orderData.requiredReagents or EMPTY_LIST) do
+	for _, slotData in pairs(orderData.slotMap or orderData.requiredReagents or EMPTY_LIST) do
 		for _, option in ipairs(slotData.options or EMPTY_LIST) do
 			TrackUnresolvedItemID(unresolvedItemIDs, option.itemID)
 		end
@@ -2355,11 +2379,18 @@ local function OrderHasUnresolvedItemData(orderData)
 	return next(orderData.unresolvedItemIDs or EMPTY_LIST) ~= nil
 end
 
-local function PrepareOrder(rawOrder)
+local function PrepareOrder(rawOrder, warningsOnly)
+	PreparationWork:Checkpoint()
 	local recipeInfo = GetRecipeInfo(rawOrder)
 	local recipeSchematic = recipeInfo and GetRecipeSchematic(recipeInfo)
 	if not (recipeInfo and recipeSchematic) then
 		return nil
+	end
+	if warningsOnly then
+		local data = {orderID = rawOrder.orderID, recipeInfo = recipeInfo}
+		BuildRequiredReagents(data, recipeSchematic.reagentSlotSchematics, rawOrder.reagents, true)
+		data.unresolvedItemIDs = CollectUnresolvedItemIDs(data)
+		return data
 	end
 
 	local output = GetOutputPresentation(rawOrder, recipeInfo)
@@ -2379,7 +2410,7 @@ local function PrepareOrder(rawOrder)
 		canSkillUp = recipeInfo.canSkillUp,
 		relativeDifficulty = recipeInfo.relativeDifficulty,
 		skillUps = recipeInfo.numSkillUps or 0,
-		unknownRecipeTooltip = isKnown and nil or BuildUnknownRecipeTooltip(recipeInfo),
+		unknownRecipeTooltip = not isKnown and BuildUnknownRecipeTooltip(recipeInfo) or nil,
 		reward = rewardData,
 	}
 
@@ -2725,17 +2756,27 @@ function Pane:RefreshDetailWarningOrderData(orderInfo)
 		self.detailWarningOrderID = nil
 		self.detailWarningOrderData = nil
 		self.detailWarningDataDirty = nil
+		self.detailWarningFingerprint = nil
 		return nil
 	end
 
+	local fingerprint = BuildOrderFingerprint(orderInfo)
 	if not self.detailWarningDataDirty
 		and self.detailWarningOrderID == orderInfo.orderID
+		and self.detailWarningFingerprint == fingerprint
 		and self.detailWarningOrderData then
 		return self.detailWarningOrderData
 	end
 
 	self.detailWarningOrderID = orderInfo.orderID
-	self.detailWarningOrderData = PrepareOrder(orderInfo)
+	self.detailWarningFingerprint = fingerprint
+	local cached = self.preparedOrderCache[orderInfo.orderID]
+	if not self.detailWarningDataDirty and cached
+		and cached.fingerprint == fingerprint and cached.generation == self.rebuildGeneration then
+		self.detailWarningOrderData = cached.data
+	else
+		self.detailWarningOrderData = PrepareOrder(orderInfo, true)
+	end
 	self.detailWarningDataDirty = nil
 	return self.detailWarningOrderData
 end
@@ -3635,6 +3676,12 @@ function Pane:UpdateToolbar()
 	end
 	self.createListButton:SetEnabled(selectedCount > 0 and provider ~= nil)
 
+	if self.selectAllButton then
+		local allSelected = self:AreAllVisibleOrdersSelected()
+		self.selectAllButton:SetText(allSelected and L.TOOLBAR_DESELECT_ALL or L.TOOLBAR_SELECT_ALL)
+		self.selectAllButton:SetEnabled(#(self.orders or EMPTY_LIST) > 0)
+	end
+
 	if self.filterButton then
 		SetFallbackFilterButtonLabel(self.filterButton, L.TOOLBAR_FILTER_BUTTON)
 		self.filterButton.tooltipTitle = L.TOOLBAR_FILTER_MENU
@@ -3646,14 +3693,16 @@ function Pane:UpdateToolbar()
 	self:UpdateFilterPanel()
 end
 
-function Pane:CollectShoppingEntries()
+function Pane:CollectShoppingEntries(includeOwned)
 	local grouped = {}
 	local selectedOrders = 0
+	local selectedOrderIDs = {}
 	local skippedEntries = 0
 
 	for _, order in ipairs(self.orders) do
 		if self.selectedOrderIDs[order.orderID] then
 			selectedOrders = selectedOrders + 1
+			selectedOrderIDs[order.orderID] = true
 			for _, materialEntry in ipairs(GetMaterialPlanEntries(order)) do
 				local option = materialEntry.option
 				if option and option.itemID and self:IsDontBuyItem(option.itemID) then
@@ -3678,6 +3727,7 @@ function Pane:CollectShoppingEntries()
 							name = option.name,
 							reagentQuality = reagentQuality,
 							required = 0,
+							orderQuantities = {},
 							unitPrice = option.unitPrice,
 							isMarketable = option.isMarketable,
 						}
@@ -3687,6 +3737,7 @@ function Pane:CollectShoppingEntries()
 						bucket.itemIdentity = itemIdentity
 					end
 					bucket.required = bucket.required + (materialEntry.quantity or 0)
+					bucket.orderQuantities[order.orderID] = (bucket.orderQuantities[order.orderID] or 0) + (materialEntry.quantity or 0)
 					bucket.unitPrice = bucket.unitPrice or option.unitPrice
 				end
 			end
@@ -3697,7 +3748,7 @@ function Pane:CollectShoppingEntries()
 	for _, entry in pairs(grouped) do
 		local owned = Util.GetQualityAwareItemCounts(entry.itemID, entry.itemLink)
 		local missing = math.max(0, entry.required - owned)
-		if missing > 0 then
+		if missing > 0 or (includeOwned and entry.required > 0) then
 			entry.quantity = missing
 			export[#export + 1] = entry
 		end
@@ -3707,11 +3758,157 @@ function Pane:CollectShoppingEntries()
 		return (left.name or UNKNOWN) < (right.name or UNKNOWN)
 	end)
 
-	return export, selectedOrders, skippedEntries
+	return export, selectedOrders, skippedEntries, selectedOrderIDs
+end
+
+function Pane._MergeShoppingEntry(store, entry)
+	local key = GetShoppingEntryGroupKey(entry)
+	local existing = store[key]
+	if existing then
+		for orderID, quantity in pairs(entry.orderQuantities or EMPTY_LIST) do
+			existing.orderQuantities[orderID] = quantity
+		end
+		if LinkHasDisplayName(entry.itemLink) and not LinkHasDisplayName(existing.itemLink) then
+			existing.itemLink = entry.itemLink
+			existing.itemIdentity = entry.itemIdentity
+		end
+	else
+		local copy = {}
+		for field, value in pairs(entry) do
+			copy[field] = value
+		end
+		copy.orderQuantities = {}
+		for orderID, quantity in pairs(entry.orderQuantities or EMPTY_LIST) do
+			copy.orderQuantities[orderID] = quantity
+		end
+		store[key] = copy
+	end
+end
+
+function Pane._FlattenSessionShoppingList(listName, store)
+	local flat = {}
+	store = store or Pane._sessionShoppingLists[listName]
+	if not store then
+		return flat
+	end
+
+	for _, entry in pairs(store) do
+		local required = 0
+		for _, quantity in pairs(entry.orderQuantities or EMPTY_LIST) do required = required + quantity end
+		-- Reserve inventory once for the combined requirements, not once per export.
+		local owned = Util.GetQualityAwareItemCounts(entry.itemID, entry.itemLink)
+		local missing = math.max(0, required - owned)
+		if missing > 0 then
+			local copy = {}
+			for field, value in pairs(entry) do copy[field] = value end
+			copy.required, copy.quantity = required, missing
+			flat[#flat + 1] = copy
+		end
+	end
+
+	table.sort(flat, function(left, right)
+		return (left.name or UNKNOWN) < (right.name or UNKNOWN)
+	end)
+
+	return flat
+end
+
+function Pane._GenerateNewSessionListName()
+	local base = LF("SHOPPING_LIST_NAME_FORMAT", Util.GetLocalTimeStamp())
+	local name, suffix = base, 1
+	while Pane._sessionShoppingLists[name] or Pricing:AuctionatorListExists(name) == true do
+		suffix = suffix + 1
+		name = base .. " (" .. suffix .. ")"
+	end
+	if Pricing:AuctionatorListExists(name) == nil then
+		-- If the optional list-manager API is unavailable, use a session-unique
+		-- name rather than risk replacing a persistent list from another login.
+		Pane._listSerial = (Pane._listSerial or 0) + 1
+		name = name .. " (" .. math.floor(GetTime() * 1000) .. "-" .. Pane._listSerial .. ")"
+	end
+	return name
+end
+
+StaticPopupDialogs["CRAFTINGORDERSPP_MERGE_SHOPPING_LIST"] = {
+	text = L.POPUP_MERGE_SHOPPING_LIST_TEXT,
+	button1 = L.POPUP_MERGE_BUTTON,
+	button2 = L.POPUP_NEW_LIST_BUTTON,
+	button3 = CANCEL,
+	OnAccept = function(_, data)
+		if data and data.entries then
+			Pane:FinalizeShoppingList("merge", data.entries, data.selectedOrderIDs, data.providerKey, data.listName)
+		end
+	end,
+	OnCancel = function(_, data, reason)
+		-- OnCancel also fires on timeout/escape; only button2 ("New List") should act.
+		if reason == "clicked" and data and data.entries then
+			Pane:FinalizeShoppingList("new", data.entries, data.selectedOrderIDs, data.providerKey)
+		end
+	end,
+	timeout = 0,
+	whileDead = true,
+	hideOnEscape = true,
+	-- Blizzard can pass "clicked" to OnCancel on Escape as well as button2.
+	noCancelOnEscape = true,
+}
+
+function Pane:FinalizeShoppingList(mode, entries, selectedOrderIDs, expectedProvider, targetName)
+	local provider = Pricing:GetActiveProvider()
+	if expectedProvider and (not provider or provider.key ~= expectedProvider) then
+		ns.Print(L.ERR_SHOPPING_PROVIDER_CHANGED)
+		return false
+	end
+	if not provider or provider.key ~= "auctionator" then
+		local ok, message = Pricing:ExportShoppingList(entries)
+		ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+		return ok
+	end
+	local listName
+	local previousName = targetName or self._lastSessionListName
+	if mode == "merge" and previousName and self._sessionShoppingLists[previousName] then
+		if Pricing:AuctionatorListExists(previousName) == false then
+			self._sessionShoppingLists[previousName] = nil
+			if self._lastSessionListName == previousName then self._lastSessionListName = nil end
+			ns.Print(L.ERR_SHOPPING_LIST_REMOVED)
+			return false
+		end
+		listName = previousName
+	else
+		listName = Pane._GenerateNewSessionListName()
+	end
+
+	local candidate = {}
+	for _, entry in pairs(self._sessionShoppingLists[listName] or EMPTY_LIST) do
+		Pane._MergeShoppingEntry(candidate, entry)
+	end
+	-- Re-exporting an order replaces its previous requirements, including when
+	-- its chosen material mix changed. Other selected orders remain untouched.
+	for key, entry in pairs(candidate) do
+		for orderID in pairs(selectedOrderIDs or EMPTY_LIST) do entry.orderQuantities[orderID] = nil end
+		if not next(entry.orderQuantities) then candidate[key] = nil end
+	end
+	for _, entry in ipairs(entries) do Pane._MergeShoppingEntry(candidate, entry) end
+	local exportEntries = Pane._FlattenSessionShoppingList(listName, candidate)
+	if #exportEntries == 0 then ns.Print(L.MSG_ALREADY_HAVE_REAGENTS); return false end
+	local ok, message = Pricing:ExportShoppingList(exportEntries, listName)
+	if ok then
+		self._sessionShoppingLists[listName] = candidate
+		self._lastSessionListName = listName
+	end
+	ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+	return ok
+end
+
+-- Auctioneer's Snatch export (Pricing:CreateAuctioneerSnatchList) has no concept of
+-- named/multiple lists at all -- it just adds snipes -- so the merge prompt only
+-- makes sense (and only ever triggered the original overwrite bug) for Auctionator.
+function Pane._ProviderSupportsMerge()
+	local provider = Pricing:GetActiveProvider()
+	return provider ~= nil and provider.key == "auctionator"
 end
 
 function Pane:CreateShoppingList()
-	local entries, selectedCount, skippedEntries = self:CollectShoppingEntries()
+	local entries, selectedCount, skippedEntries, selectedOrderIDs = self:CollectShoppingEntries(Pane._ProviderSupportsMerge())
 	if selectedCount == 0 then
 		ns.Print(L.MSG_SELECT_ORDERS_FIRST)
 		return
@@ -3726,9 +3923,69 @@ function Pane:CreateShoppingList()
 		return
 	end
 
-	local listName = LF("SHOPPING_LIST_NAME_FORMAT", Util.GetLocalTimeStamp())
-	local ok, message = Pricing:ExportShoppingList(entries, listName)
-	ns.Print(ok and message or LF("MSG_SHOPPING_LIST_EXPORT_FAILED_FORMAT", message or UNKNOWN))
+	if Pane._lastSessionListName and Pricing:AuctionatorListExists(Pane._lastSessionListName) == false then
+		Pane._sessionShoppingLists[Pane._lastSessionListName] = nil
+		Pane._lastSessionListName = nil
+	end
+	if Pane._ProviderSupportsMerge() and Pane._lastSessionListName and Pane._sessionShoppingLists[Pane._lastSessionListName] then
+		StaticPopup_Show("CRAFTINGORDERSPP_MERGE_SHOPPING_LIST", Pane._lastSessionListName, #entries, {
+			entries = entries, selectedOrderIDs = selectedOrderIDs, providerKey = "auctionator", listName = Pane._lastSessionListName,
+		})
+	else
+		self:FinalizeShoppingList("new", entries, selectedOrderIDs)
+	end
+end
+
+function Pane:ResetSessionShoppingLists()
+	if not Pane._lastSessionListName then
+		ns.Print(L.MSG_NO_SESSION_SHOPPING_LIST)
+		return
+	end
+
+	wipe(Pane._sessionShoppingLists)
+	Pane._lastSessionListName = nil
+	ns.Print(L.MSG_SESSION_SHOPPING_LIST_RESET)
+end
+
+function Pane:AreAllVisibleOrdersSelected()
+	local orders = self.orders or EMPTY_LIST
+	if #orders == 0 then
+		return false
+	end
+
+	for _, order in ipairs(orders) do
+		if not self.selectedOrderIDs[order.orderID] then
+			return false
+		end
+	end
+	return true
+end
+
+function Pane:ToggleSelectAll()
+	local orders = self.orders or EMPTY_LIST
+	if #orders == 0 then
+		return
+	end
+
+	local selectAll = not self:AreAllVisibleOrdersSelected()
+	for _, order in ipairs(orders) do
+		self.selectedOrderIDs[order.orderID] = selectAll or nil
+	end
+
+	-- FullUpdate's dirty-tracking may skip re-initializing rows that are already
+	-- visible and whose underlying element data hasn't changed, so the checkboxes
+	-- wouldn't visually flip even though selectedOrderIDs is correct. Force every
+	-- pooled row frame's checkbox directly instead of trusting that.
+	if self.rows then
+		for _, row in ipairs(self.rows) do
+			if row.checkbox and row.order then
+				row.checkbox:SetChecked(not not self.selectedOrderIDs[row.order.orderID])
+			end
+		end
+	end
+
+	self:UpdateScrollBox()
+	self:UpdateToolbar()
 end
 
 function Pane:ApplyReferenceLayout()
@@ -3785,13 +4042,24 @@ function Pane:BuildFrame()
 	self.createListButton:SetNormalFontObject(GameFontNormalSmall)
 	self.createListButton:SetHighlightFontObject(GameFontHighlightSmall)
 	self.createListButton:SetMotionScriptsWhileDisabled(true)
-	self.createListButton:SetScript("OnClick", function()
-		Pane:CreateShoppingList()
+	self.createListButton:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	self.createListButton:SetScript("OnClick", function(_, button)
+		if button == "RightButton" then
+			Pane:ResetSessionShoppingLists()
+		else
+			Pane:CreateShoppingList()
+		end
 	end)
 	self.createListButton:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 		GameTooltip:SetText(self.tooltipTitle or L.TOOLBAR_CREATE_SHOPPING_LIST)
 		GameTooltip:AddLine(self.tooltipText or L.TOOLBAR_SELECT_ORDERS_TOOLTIP, 1, 1, 1, true)
+		local activeProvider = Pricing:GetActiveProvider()
+		if Pane._lastSessionListName and activeProvider and activeProvider.key == "auctionator" then
+			GameTooltip:AddLine(" ")
+			GameTooltip:AddLine(LF("TOOLBAR_WILL_MERGE_INTO_FORMAT", Pane._lastSessionListName), 0.6, 0.8, 1, true)
+			GameTooltip:AddLine(L.TOOLBAR_RIGHTCLICK_RESET_HINT, 0.7, 0.7, 0.7, true)
+		end
 		GameTooltip:Show()
 	end)
 	self.createListButton:SetScript("OnLeave", GameTooltip_Hide)
@@ -3868,6 +4136,32 @@ function Pane:BuildFrame()
 	self.concentrationFilterButtons[CONCENTRATION_FILTER_NONE]:SetScript("OnClick", function()
 		Pane:SetConcentrationFilter(Pane.concentrationFilter == CONCENTRATION_FILTER_NONE and CONCENTRATION_FILTER_ALL or CONCENTRATION_FILTER_NONE)
 	end)
+
+	-- Lives in the filter dropdown rather than the main toolbar: that row (checkbox
+	-- column + 5 headers + filter button) is already packed edge to edge with no
+	-- spare pixels, so a wider button there overlaps the column headers and the tab bar.
+	self.filterPanel.selectAllHeader = self.filterPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	self.filterPanel.selectAllHeader:SetPoint("TOPLEFT", self.concentrationFilterButtons[CONCENTRATION_FILTER_NONE], "BOTTOMLEFT", 2, -12)
+	self.filterPanel.selectAllHeader:SetWidth(FILTER_PANEL_WIDTH - 28)
+	self.filterPanel.selectAllHeader:SetJustifyH("LEFT")
+	self.filterPanel.selectAllHeader:SetText(L.FILTER_BULK_SELECT_HEADER)
+
+	self.selectAllButton = CreateFrame("Button", nil, self.filterPanel, "UIPanelButtonTemplate")
+	self.selectAllButton:SetPoint("TOPLEFT", self.filterPanel.selectAllHeader, "BOTTOMLEFT", -2, -6)
+	self.selectAllButton:SetSize(FILTER_PANEL_WIDTH - 24, 20)
+	self.selectAllButton:SetNormalFontObject(GameFontNormalSmall)
+	self.selectAllButton:SetHighlightFontObject(GameFontHighlightSmall)
+	self.selectAllButton:SetText(L.TOOLBAR_SELECT_ALL)
+	self.selectAllButton:SetScript("OnClick", function()
+		Pane:ToggleSelectAll()
+	end)
+	self.selectAllButton:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(self.tooltipTitle or L.TOOLBAR_SELECT_ALL)
+		GameTooltip:AddLine(self.tooltipText or L.TOOLBAR_SELECT_ALL_TOOLTIP, 1, 1, 1, true)
+		GameTooltip:Show()
+	end)
+	self.selectAllButton:SetScript("OnLeave", GameTooltip_Hide)
 
 	self.headers = {
 		order = CreateHeaderButton(root, L.HEADER_YOU_CRAFT_SUPPLY, "order", ORDER_WIDTH, SELECT_WIDTH + 2),
@@ -3948,6 +4242,10 @@ function Pane:BuildFrame()
 		end)
 		Pane:BeginVisibleSession()
 		Pane:MarkDirty("show")
+	end)
+	root:SetScript("OnHide", function()
+		Pane:CancelPreparation()
+		Pane.trailingDirtyTokens = nil
 	end)
 	root:SetScript("OnUpdate", function(_, elapsed)
 		Pane.elapsedSinceTick = (Pane.elapsedSinceTick or 0) + elapsed
@@ -4463,7 +4761,10 @@ function Pane:HasTimedOutRequestForVisibleSession(profession)
 end
 
 function Pane:NeedsPreparedOrderRebuild(profession)
-	return profession ~= nil
+	-- Readiness/show events can arrive while this generation is being prepared.
+	-- Its visible generation stays old until commit; restarting here starves it.
+	return not self.preparationPending
+		and profession ~= nil
 		and self.ordersProfession == profession
 		and (self.ordersGeneration or 0) ~= (self.rebuildGeneration or 0)
 end
@@ -4480,6 +4781,8 @@ function Pane:PruneSelectedOrders()
 end
 
 function Pane:ClearVisibleOrders(profession)
+	self:CancelPreparation()
+	self.preparedOrderCache = {}
 	self.allOrders = {}
 	self.orders = {}
 	self.ordersProfession = profession
@@ -4519,7 +4822,17 @@ function Pane:BeginVisibleSession()
 end
 
 function Pane:BumpPreparedOrderGeneration()
+	self:CancelPreparation()
 	self.rebuildGeneration = (self.rebuildGeneration or 0) + 1
+end
+
+function Pane:CancelPreparation()
+	if self.preparationPending then
+		PreparationWork:Cancel()
+		self.preparationPending = nil
+		-- A cancelled refresh must be retried when the panel is reopened.
+		self.ordersGeneration = -1
+	end
 end
 
 function Pane:ChoosePendingReason(reason)
@@ -4566,6 +4879,12 @@ function Pane:ShouldQueueOpenRequest(profession)
 	if not profession then
 		return false
 	end
+	-- A successful empty response is still a completed request. Do not poll the
+	-- server again on every CAN_REQUEST event while no patron orders exist.
+	if self:HasSuccessfulRequestForVisibleSession(profession)
+		and not self:HasTimedOutRequestForVisibleSession(profession) then
+		return false
+	end
 
 	return self.ordersProfession ~= profession
 		or not self:HasVisibleOrdersForProfession(profession)
@@ -4585,7 +4904,7 @@ function Pane:UpdateEmptyState()
 
 	local hasOrders = #(self.orders or EMPTY_LIST) > 0
 	local hasPreparedOrders = #(self.allOrders or EMPTY_LIST) > 0
-	local isLoading = not hasOrders and self:IsLoadingOrders()
+	local isLoading = not hasOrders and (self:IsLoadingOrders() or self.preparationPending)
 	local emptyText = EMPTY_STATE_EMPTY_TEXT
 	if not isLoading and not hasOrders and hasPreparedOrders and self:HasActiveFilters() then
 		emptyText = EMPTY_STATE_FILTERED_TEXT
@@ -4609,8 +4928,14 @@ function Pane:MarkDirty(reason)
 	local professionChanged = false
 	local configKey = GetConfigKeyFromReason(reason)
 
-	if DoesReasonBumpGeneration(reason) or (reason == "item-data" and self.hasUnresolvedItemData) then
+	if DoesReasonBumpGeneration(reason) then
 		self:BumpPreparedOrderGeneration()
+	end
+	if reason == "item-data" then
+		-- Reuse complete orders when only missing item data changed.
+		for _, cached in pairs(self.preparedOrderCache) do
+			if cached.hasUnresolvedItemData then cached.generation = -1 end
+		end
 	end
 
 	if isVisible then
@@ -4642,6 +4967,9 @@ function Pane:MarkDirty(reason)
 		self.needsRebuild = true
 	elseif IsRenderOnlyConfigKey(configKey) then
 		self.needsRender = true
+	end
+	if self.needsRebuild and reason ~= "sort" and reason ~= "filter" then
+		self:CancelPreparation()
 	end
 
 	if not isVisible then
@@ -4809,49 +5137,72 @@ function Pane:RebuildPreparedOrders()
 		return false
 	end
 
-	local preparedOrders = {}
-	local preparedOrderCache = {}
-	local hasUnresolvedItemData = false
-	local unresolvedItemIDs = {}
+	self:CancelPreparation()
+	local generation = self.rebuildGeneration
+	local session = self.visibleSessionId
+	local serial = (self.preparationSerial or 0) + 1
+	self.preparationSerial = serial
+	self.preparationPending = true
+	self:UpdateEmptyState()
 
-	for _, rawOrder in ipairs(rawOrders) do
-		local fingerprint = BuildOrderFingerprint(rawOrder)
-		local cacheEntry = self.preparedOrderCache[rawOrder.orderID]
-		local orderData
-
-		if cacheEntry
-			and cacheEntry.fingerprint == fingerprint
-			and cacheEntry.generation == self.rebuildGeneration then
-			orderData = cacheEntry.data
-			hasUnresolvedItemData = hasUnresolvedItemData or not not cacheEntry.hasUnresolvedItemData
-		else
-			orderData = PrepareOrder(rawOrder)
-			hasUnresolvedItemData = hasUnresolvedItemData or not not (orderData and orderData.hasUnresolvedItemData)
-		end
-
-		if orderData then
-			preparedOrders[#preparedOrders + 1] = orderData
-			for itemID in pairs(orderData.unresolvedItemIDs or EMPTY_LIST) do
-				unresolvedItemIDs[itemID] = true
+	PreparationWork:Start(function()
+		local preparedOrders, preparedOrderCache, unresolvedItemIDs = {}, {}, {}
+		for _, rawOrder in ipairs(rawOrders) do
+			PreparationWork:Checkpoint()
+			local fingerprint = BuildOrderFingerprint(rawOrder)
+			local cached = self.preparedOrderCache[rawOrder.orderID]
+			local orderData
+			if cached and cached.fingerprint == fingerprint and cached.generation == generation then
+				orderData = cached.data
+			else
+				orderData = PrepareOrder(rawOrder)
 			end
-			preparedOrderCache[rawOrder.orderID] = {
-				fingerprint = fingerprint,
-				generation = self.rebuildGeneration,
-				data = orderData,
-				hasUnresolvedItemData = orderData.hasUnresolvedItemData or false,
-			}
+			if orderData then
+				preparedOrders[#preparedOrders + 1] = orderData
+				for itemID in pairs(orderData.unresolvedItemIDs or EMPTY_LIST) do
+					unresolvedItemIDs[itemID] = true
+				end
+				preparedOrderCache[rawOrder.orderID] = {
+					fingerprint = fingerprint, generation = generation, data = orderData,
+					hasUnresolvedItemData = orderData.hasUnresolvedItemData or false,
+				}
+			end
 		end
-	end
-
-	self.preparedOrderCache = preparedOrderCache
-	self.allOrders = preparedOrders
-	self:ApplyOrderFilters()
-	self.ordersProfession = currentProfession
-	self.ordersGeneration = self.rebuildGeneration
-	self.hasUnresolvedItemData = hasUnresolvedItemData
-	self.unresolvedItemIDs = unresolvedItemIDs
-	self:PruneSelectedOrders()
-	return true
+		return {orders = preparedOrders, cache = preparedOrderCache, unresolved = unresolvedItemIDs}
+	end, function()
+		return self.preparationSerial == serial and self.rebuildGeneration == generation
+			and self.visibleSessionId == session and self.root and self.root:IsShown()
+			and self:GetCurrentProfessionID() == currentProfession
+	end, function(result)
+		-- Commit a complete snapshot. Existing rows stay usable during preparation.
+		self.preparationPending = nil
+		self.preparedOrderCache = result.cache
+		self.allOrders = result.orders
+		self.ordersProfession = currentProfession
+		self.ordersGeneration = generation
+		self.unresolvedItemIDs = result.unresolved
+		self.hasUnresolvedItemData = next(result.unresolved) ~= nil
+		self:PruneSelectedOrders()
+		self.needsRender = true
+		self:SchedulePendingRefresh("prepared", 0)
+		-- Item data may have arrived while a calculation was suspended, before
+		-- the new unresolved-ID set was visible to our event handler.
+		for itemID in pairs(result.unresolved) do
+			if not IsItemDataPending(itemID) then
+				self:ScheduleTrailingDirty("item-data", ITEM_DATA_REFRESH_DELAY)
+				break
+			end
+		end
+	end, function(invalidated)
+		if self.preparationSerial ~= serial then return end
+		self.preparationPending = nil
+		self.ordersGeneration = -1
+		if invalidated and self.root and self.root:IsShown() then
+			self.needsRebuild = true
+			self:SchedulePendingRefresh("trade-skill-source", 0)
+		end
+	end)
+	return false
 end
 
 function Pane:ProcessPendingRefresh()
@@ -4895,6 +5246,7 @@ function Pane:SetCustomPaneShown(isShown)
 	if isShown then
 		self:ApplyReferenceLayout()
 	else
+		self:CancelPreparation()
 		if self.filterPanel then
 			self.filterPanel:Hide()
 		end
@@ -5056,17 +5408,21 @@ end
 
 function Pane:ScheduleTrailingDirty(reason, delay)
 	self.trailingDirtyTokens = self.trailingDirtyTokens or {}
-	local token = (self.trailingDirtyTokens[reason] or 0) + 1
-	self.trailingDirtyTokens[reason] = token
-
-	C_Timer.After(delay or 0, function()
-		if not Pane or not Pane.trailingDirtyTokens or Pane.trailingDirtyTokens[reason] ~= token then
-			return
-		end
-
+	local pending = self.trailingDirtyTokens[reason]
+	if pending then
+		pending.dueAt = GetTime() + (delay or 0)
+		return
+	end
+	pending = {dueAt = GetTime() + (delay or 0)}
+	self.trailingDirtyTokens[reason] = pending
+	local function Flush()
+		if not Pane.trailingDirtyTokens or Pane.trailingDirtyTokens[reason] ~= pending then return end
+		local remaining = pending.dueAt - GetTime()
+		if remaining > 0 then C_Timer.After(remaining, Flush); return end
 		Pane.trailingDirtyTokens[reason] = nil
 		Pane:MarkDirty(reason)
-	end)
+	end
+	C_Timer.After(delay or 0, Flush)
 end
 
 function Pane:InitializeEvents()
@@ -5089,7 +5445,8 @@ function Pane:InitializeEvents()
 		Pane:MarkDirty("rewards")
 	end)
 
-	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function(_, itemID)
+	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function(_, itemID, success)
+		if success == false then return end
 		if Pane.root
 			and Pane.root:IsShown()
 			and type(itemID) == "number"
@@ -5097,7 +5454,10 @@ function Pane:InitializeEvents()
 			and Pane.unresolvedItemIDs[itemID] then
 			Pane:ScheduleTrailingDirty("item-data", ITEM_DATA_REFRESH_DELAY)
 		end
-		Pane:MarkDetailWarningDirty()
+		local detail = Pane.detailWarningOrderData
+		if detail and detail.unresolvedItemIDs and detail.unresolvedItemIDs[itemID] then
+			Pane:MarkDetailWarningDirty()
+		end
 	end)
 
 	ns.RegisterEvent("TRADE_SKILL_DATA_SOURCE_CHANGED", function()
