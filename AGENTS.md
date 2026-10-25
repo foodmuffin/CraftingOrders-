@@ -122,6 +122,10 @@ The addon's job is to make Patron orders faster to evaluate without replacing th
 - Expensive-ingredient warnings exist in two places:
   - a summary warning aligned on the same row as `Use Best Quality Reagents`
   - a small warning badge over affected reagent slots
+- The same badge and tooltip also appear on the planned reagent icons in the Patron list.
+  - It uses the same setting and threshold as the detail pane warning.
+  - It pairs the tiers of an ingredient by item name, so it requests any tier whose name is not loaded yet and
+    redraws the list when it arrives. Do not rely on another UI having loaded those items.
 - The slot warning should overlap the reagent like a badge, not float above it.
 - The warning tooltip should focus on:
   - selected cost
@@ -334,6 +338,8 @@ Rules:
 - There is a setting to switch to per-character storage.
 - The only functional effect of `Don't Buy` is shopping export.
   It must not affect cost, reward, profit, or quality simulation.
+- A marked reagent always shows the cross.
+  It is drawn on a child frame above the icon so it stays above the count text, which draws over any texture on the icon itself.
 
 ## Detail Pane Rules
 

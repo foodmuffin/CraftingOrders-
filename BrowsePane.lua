@@ -3063,6 +3063,83 @@ function Pane:ShowProfitTooltip(row)
 	GameTooltip:Show()
 end
 
+-- The warning pairs the tiers of an ingredient by item name. The name of a tier nobody has looked at yet may not
+-- be loaded, and nothing else asks for it until an order's detail panel opens, so request it here and redraw
+-- the list when it arrives (see the ITEM_DATA_LOAD_RESULT handler).
+local function RequestMissingItemName(option)
+	local itemID = option and option.itemID
+	if not itemID or option.name or Util.GetItemName(option.itemLink or itemID) then
+		return
+	end
+
+	Pane.warningRequestedItemIDs = Pane.warningRequestedItemIDs or {}
+	if Pane.warningRequestedItemIDs[itemID] then
+		return
+	end
+
+	Pane.warningRequestedItemIDs[itemID] = true
+	if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+		pcall(C_Item.RequestLoadItemDataByID, itemID)
+	end
+end
+
+function Pane:ScheduleWarningRedraw()
+	if self.warningRedrawQueued then
+		return
+	end
+
+	self.warningRedrawQueued = true
+	C_Timer.After(0.2, function()
+		Pane.warningRedrawQueued = nil
+		if Pane.root and Pane.root:IsShown() then
+			Pane:UpdateScrollBox()
+		end
+	end)
+end
+
+-- The order window's expensive-ingredient check, for one reagent in a Patron row's planned materials.
+-- Returns a warning entry in the shape the badge tooltip expects, or nil when the reagent is fine.
+local function BuildPlanEntryWarning(entry, thresholdPercent)
+	local option = entry and entry.option
+	RequestMissingItemName(option)
+	local groupKey = GetExpensiveIngredientGroupKey(option)
+	if not (groupKey and IsPricedMarketOption(option)) or (entry.quantity or 0) <= 0 then
+		return nil
+	end
+
+	local cheapest
+	local groupCount = 0
+	for _, candidate in ipairs(entry.slotData and entry.slotData.options or EMPTY_LIST) do
+		RequestMissingItemName(candidate)
+		if GetExpensiveIngredientGroupKey(candidate) == groupKey and IsPricedMarketOption(candidate) then
+			groupCount = groupCount + 1
+			if IsCheaperWarningOption(candidate, cheapest) then
+				cheapest = candidate
+			end
+		end
+	end
+
+	if not cheapest or cheapest == option or groupCount < 2 then
+		return nil
+	end
+
+	local percentAbove = ((option.unitPrice - cheapest.unitPrice) / cheapest.unitPrice) * 100
+	if percentAbove <= thresholdPercent then
+		return nil
+	end
+
+	return {
+		quantity = entry.quantity,
+		selectedOption = { itemLink = option.itemLink, name = option.name },
+		selectedUnitPrice = option.unitPrice,
+		cheapestOption = { itemLink = cheapest.itemLink, name = cheapest.name },
+		cheapestUnitPrice = cheapest.unitPrice,
+		percentAbove = percentAbove,
+		percentAboveRounded = math.floor(percentAbove + 0.5),
+		totalSavings = math.max(0, (option.unitPrice - cheapest.unitPrice) * entry.quantity),
+	}
+end
+
 function Pane:ShowIconTooltip(iconFrame)
 	local data = iconFrame.data
 	if not data then
@@ -3141,6 +3218,9 @@ function Pane:SetIconData(iconFrame, data)
 		if iconFrame.favorite then
 			iconFrame.favorite:Hide()
 		end
+		if iconFrame.warning then
+			iconFrame.warning:Hide()
+		end
 		iconFrame:Hide()
 		return
 	end
@@ -3154,6 +3234,12 @@ function Pane:SetIconData(iconFrame, data)
 	end
 	if iconFrame.blocked then
 		iconFrame.blocked:SetShown(not not data.doNotBuy)
+	end
+	if iconFrame.warning then
+		local hasWarning = data.warningEntries and #data.warningEntries > 0
+		iconFrame.warning.warningEntries = hasWarning and data.warningEntries or nil
+		iconFrame.warning.thresholdPercent = data.warningThresholdPercent
+		iconFrame.warning:SetShown(not not hasWarning)
 	end
 	if data.shortage and data.shortage > 0 then
 		if (data.otherQualityOwnedCount or 0) > 0 then
@@ -3184,11 +3270,35 @@ function Pane:CreateIcon(parent)
 	iconButton.favorite:SetPoint("TOPRIGHT", iconButton, "TOPRIGHT", 3, 2)
 	iconButton.favorite:Hide()
 
-	iconButton.blocked = iconButton:CreateTexture(nil, "HIGHLIGHT")
+	-- Always visible (a HIGHLIGHT layer only draws on mouseover). It sits on its own child frame because text
+	-- is drawn above textures within one layer, so a texture on the icon itself can never cover the count.
+	-- The frame ignores the mouse, so hovering and clicking still reach the icon.
+	iconButton.blockedFrame = CreateFrame("Frame", nil, iconButton)
+	iconButton.blockedFrame:SetAllPoints(iconButton)
+	iconButton.blockedFrame:SetFrameLevel((iconButton:GetFrameLevel() or 0) + 4)
+	iconButton.blocked = iconButton.blockedFrame:CreateTexture(nil, "OVERLAY")
 	iconButton.blocked:SetTexture(DONT_BUY_OVERLAY_TEXTURE)
 	iconButton.blocked:SetSize(18, 18)
 	iconButton.blocked:SetPoint("CENTER", iconButton, "CENTER")
 	iconButton.blocked:Hide()
+
+	-- Same badge and tooltip as the order window's expensive-ingredient warning.
+	iconButton.warning = CreateFrame("Button", nil, iconButton)
+	iconButton.warning:SetSize(14, 14)
+	iconButton.warning:SetPoint("TOPRIGHT", iconButton, "TOPRIGHT", 4, 3)
+	iconButton.warning:SetFrameLevel((iconButton:GetFrameLevel() or 0) + 5)
+	iconButton.warning.icon = iconButton.warning:CreateTexture(nil, "ARTWORK")
+	iconButton.warning.icon:SetTexture(DETAIL_WARNING_ICON_TEXTURE)
+	iconButton.warning.icon:SetAllPoints()
+	iconButton.warning:SetScript("OnEnter", function(self)
+		Pane:ShowDetailExpensiveIngredientSlotTooltip(self)
+	end)
+	iconButton.warning:SetScript("OnLeave", GameTooltip_Hide)
+	if type(iconButton.warning.SetPropagateMouseClicks) == "function" then
+		-- Clicks on the badge still reach the icon underneath (Don't Buy toggle, opening the order).
+		iconButton.warning:SetPropagateMouseClicks(true)
+	end
+	iconButton.warning:Hide()
 
 	iconButton.count = iconButton:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
 	iconButton.count:SetPoint("BOTTOMRIGHT", iconButton, "BOTTOMRIGHT", -2, 2)
@@ -4119,10 +4229,15 @@ function Pane:ApplyRowData(row, elementData)
 	})
 
 	local reagentIcons = {}
+	local warnExpensiveIngredients = ns.GetConfig("warnExpensiveIngredients") ~= false
+	local warningThresholdPercent = GetExpensiveIngredientThresholdPercent()
 	for _, entry in ipairs(GetMaterialPlanEntries(order)) do
 		local option = entry.option
 		if option then
+			local warning = warnExpensiveIngredients and BuildPlanEntryWarning(entry, warningThresholdPercent) or nil
 			reagentIcons[#reagentIcons + 1] = {
+				warningEntries = warning and { warning } or nil,
+				warningThresholdPercent = warningThresholdPercent,
 				itemID = option.itemID,
 				itemLink = option.itemLink,
 				icon = select(5, C_Item.GetItemInfoInstant(option.itemID)),
@@ -4265,6 +4380,8 @@ end
 
 local function IsRenderOnlyConfigKey(configKey)
 	return configKey == "greyUnknownRecipes"
+		or configKey == "warnExpensiveIngredients"
+		or configKey == "expensiveIngredientThresholdPercent"
 		or configKey == "showSilverCopperInList"
 		or configKey == "dontBuyPerCharacter"
 end
@@ -5090,6 +5207,9 @@ function Pane:InitializeEvents()
 	end)
 
 	ns.RegisterEvent("ITEM_DATA_LOAD_RESULT", function(_, itemID)
+		if Pane.warningRequestedItemIDs and Pane.warningRequestedItemIDs[itemID] then
+			Pane:ScheduleWarningRedraw()
+		end
 		if Pane.root
 			and Pane.root:IsShown()
 			and type(itemID) == "number"

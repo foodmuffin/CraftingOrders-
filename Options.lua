@@ -112,6 +112,11 @@ function Options:UpdateScrollLayout()
 	local scrollWidth = scrollFrame:GetWidth() or 0
 	if scrollWidth > 0 then
 		scrollChild:SetWidth(math.max(660, math.floor(scrollWidth - 24)))
+
+		-- Keep the ingredient warning hint inside the visible area on narrow windows.
+		if self.panel.warningHint then
+			self.panel.warningHint:SetWidth(math.max(240, math.min(620, math.floor(scrollWidth - 48))))
+		end
 	end
 
 	local top = scrollChild:GetTop()
@@ -304,7 +309,7 @@ function Options:BuildPanel()
 		panel.expensiveIngredientThreshold,
 		"BOTTOMLEFT",
 		0,
-		-8,
+		-20,
 		620
 	)
 
