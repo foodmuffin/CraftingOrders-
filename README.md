@@ -29,7 +29,7 @@ The addon is built to feel native to Blizzard's UI while making the Patron tab f
 - Reward value support that includes both gold and market-priced reward items
 - Profit calculation based on your supplied materials versus the total reward value
 - Multi-select patron orders and export missing reagents to a shopping list
-- Optional Auctionator or Auctioneer support for reagent pricing and reward valuation
+- Optional Auctionator, Auctioneer, or TradeSkillMaster support for reagent pricing and reward valuation
 - A persistent `Don't Buy` reagent toggle so you can exclude items from shopping-list exports
 
 ### Why It Is Useful
@@ -72,6 +72,11 @@ Crafting Orders++ works without pricing addons, but pricing-aware features are m
 
 `Auctioneer`
   Supports reagent cost, reward valuation, profit display, and shopping export to Snatch when available.
+
+`TradeSkillMaster`
+  Supports reagent cost, reward valuation, and profit display using a TSM price source you choose in the options: `DBMinBuyout` (default), `DBRecent`, or `DBMarket`. Shopping lists are still created in Auctionator when it is installed.
+
+When prices are available, the planned materials are the cheapest mix that still reaches the requested quality, so a higher reagent tier is used when it costs less than a lower one. Reward items are valued after the 5% auction house cut.
 
 If no supported pricing addon is detected, the addon still improves the Patron list and recipe visibility, but price-based columns and shopping export will be limited.
 

@@ -93,6 +93,21 @@ local function SetSliderEnabled(slider, enabled)
 	slider:SetAlpha(enabled and 1 or 0.45)
 end
 
+local TSM_SUB_OPTION_INDENT = 24
+
+local function SetRadioEnabled(radio, enabled)
+	if not radio then
+		return
+	end
+
+	radio:SetEnabled(enabled)
+	radio:EnableMouse(enabled)
+	radio:SetAlpha(enabled and 1 or 0.45)
+	if radio.label then
+		radio.label:SetFontObject(enabled and "GameFontHighlight" or "GameFontDisable")
+	end
+end
+
 local function UpdatePercentSliderText(slider, prefix, value)
 	if not slider or not slider.Text then
 		return
@@ -112,6 +127,11 @@ function Options:UpdateScrollLayout()
 	local scrollWidth = scrollFrame:GetWidth() or 0
 	if scrollWidth > 0 then
 		scrollChild:SetWidth(math.max(660, math.floor(scrollWidth - 24)))
+
+		-- Keep the pricing hint inside the visible area on narrow windows.
+		if self.panel.sourceFooter then
+			self.panel.sourceFooter:SetWidth(math.max(240, math.min(640, math.floor(scrollWidth - 48))))
+		end
 	end
 
 	local top = scrollChild:GetTop()
@@ -224,7 +244,42 @@ function Options:BuildPanel()
 		end
 	)
 
-	panel.sourceFooter = CreateLabel(panel, "GameFontHighlightSmall", "", "TOPLEFT", panel.sourceAuctioneer, "BOTTOMLEFT", 0, -10, 640)
+	panel.sourceTSM = CreateRadioButton(
+		panel,
+		L.OPTION_PRICING_TSM,
+		"TOPLEFT",
+		panel.sourceAuctioneer,
+		"BOTTOMLEFT",
+		0,
+		-6,
+		function(self)
+			self:SetChecked(true)
+			ns.SetConfig("pricingSource", "tsm")
+		end
+	)
+
+	panel.tsmSourceRadios = {}
+	local previousTSMRadio = panel.sourceTSM
+	for _, priceSource in ipairs(ns.Pricing.TSM_PRICE_SOURCES) do
+		local radio = CreateRadioButton(
+			panel,
+			L["OPTION_TSM_SOURCE_" .. priceSource:upper()],
+			"TOPLEFT",
+			previousTSMRadio,
+			"BOTTOMLEFT",
+			previousTSMRadio == panel.sourceTSM and TSM_SUB_OPTION_INDENT or 0,
+			-4,
+			function(self)
+				self:SetChecked(true)
+				ns.SetConfig("tsmPriceSource", priceSource)
+			end
+		)
+		radio.priceSource = priceSource
+		panel.tsmSourceRadios[#panel.tsmSourceRadios + 1] = radio
+		previousTSMRadio = radio
+	end
+
+	panel.sourceFooter = CreateLabel(panel, "GameFontHighlightSmall", "", "TOPLEFT", previousTSMRadio, "BOTTOMLEFT", -TSM_SUB_OPTION_INDENT, -10, 640)
 	panel.preferencesHeader = CreateLabel(panel, "GameFontNormal", L.OPTION_DISPLAY_HEADER, "TOPLEFT", panel.sourceFooter, "BOTTOMLEFT", 0, -18)
 
 	panel.greyUnknownRecipes = CreateCheckButton(
@@ -408,6 +463,7 @@ function Options:BuildPanel()
 		panel.noPricingInfo,
 		panel.sourceAuctionator,
 		panel.sourceAuctioneer,
+		panel.sourceTSM,
 		panel.sourceFooter,
 		panel.preferencesHeader,
 		panel.greyUnknownRecipes,
@@ -424,6 +480,10 @@ function Options:BuildPanel()
 		panel.dontBuyScopeHint,
 		panel.footer,
 	}
+
+	for _, radio in ipairs(panel.tsmSourceRadios) do
+		panel.scrollWidgets[#panel.scrollWidgets + 1] = radio
+	end
 
 	for _, widget in ipairs(panel.scrollWidgets) do
 		widget:SetParent(panel.scrollChild)
@@ -471,8 +531,31 @@ function Options:Refresh()
 	LayoutDetectedRadio(self.panel.sourceAuctionator, status.auctionatorDetected, -8)
 	LayoutDetectedRadio(self.panel.sourceAuctioneer, status.auctioneerDetected, visibleSourceCount > 0 and -6 or -8)
 
+	LayoutDetectedRadio(self.panel.sourceTSM, status.tsmDetected, visibleSourceCount > 0 and -6 or -8)
+
 	self.panel.sourceAuctionator:SetChecked(selectedProviderKey == "auctionator")
 	self.panel.sourceAuctioneer:SetChecked(selectedProviderKey == "auctioneer")
+	self.panel.sourceTSM:SetChecked(selectedProviderKey == "tsm")
+
+	-- The sub-options sit under the TSM radio and only apply while TSM is the active pricing source.
+	local tsmPriceSource = ns.Pricing:GetTSMPriceSource()
+	local tsmSelected = selectedProviderKey == "tsm"
+	local previousTSMRadio = self.panel.sourceTSM
+	local anchorIndent = 0
+	for _, radio in ipairs(self.panel.tsmSourceRadios) do
+		radio:ClearAllPoints()
+		if status.tsmDetected then
+			radio:SetPoint("TOPLEFT", previousTSMRadio, "BOTTOMLEFT", previousTSMRadio == self.panel.sourceTSM and TSM_SUB_OPTION_INDENT or 0, -4)
+			anchorIndent = TSM_SUB_OPTION_INDENT
+			radio:Show()
+			radio:SetChecked(radio.priceSource == tsmPriceSource)
+			SetRadioEnabled(radio, tsmSelected)
+			previousTSMRadio = radio
+			lastPricingAnchor = radio
+		else
+			radio:Hide()
+		end
+	end
 
 	self.panel.noPricingInfo:ClearAllPoints()
 	self.panel.noPricingInfo:SetPoint("TOPLEFT", self.panel.sourceHeader, "BOTTOMLEFT", 0, -8)
@@ -483,10 +566,13 @@ function Options:Refresh()
 		self.panel.sourceFooter:Hide()
 		lastPricingAnchor = self.panel.noPricingInfo
 	else
-		self.panel.sourceFooter:SetPoint("TOPLEFT", lastPricingAnchor, "BOTTOMLEFT", 0, -10)
+		-- Undo the sub-option indent so the footer and everything below it line up with the left edge.
+		self.panel.sourceFooter:SetPoint("TOPLEFT", lastPricingAnchor, "BOTTOMLEFT", -anchorIndent, -10)
 		self.panel.sourceFooter:SetShown(true)
 		if selectedProviderKey == "auctioneer" then
 			self.panel.sourceFooter:SetText(L.OPTION_PRICING_FOOTER_AUCTIONEER)
+		elseif selectedProviderKey == "tsm" then
+			self.panel.sourceFooter:SetText(L["OPTION_PRICING_FOOTER_TSM_" .. tsmPriceSource:upper()])
 		else
 			self.panel.sourceFooter:SetText(L.OPTION_PRICING_FOOTER_AUCTIONATOR)
 		end

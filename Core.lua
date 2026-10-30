@@ -15,6 +15,7 @@ local CURSE_PROJECT_VERSION_TOKEN = "@project" .. "-version@"
 
 local defaults = {
 	pricingSource = "auctionator",
+	tsmPriceSource = "DBMinBuyout",
 	dontBuyItems = {},
 	dontBuyItemsByCharacter = {},
 	dontBuyPerCharacter = false,

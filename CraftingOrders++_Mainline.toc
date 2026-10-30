@@ -5,7 +5,7 @@
 ## Notes: Improved patron crafting orders with pricing and shopping list tools.
 ## Category: Professions
 ## IconTexture: Interface\AddOns\CraftingOrders++\CraftingOrdersPP_Icon
-## OptionalDeps: Blizzard_Professions, Auctionator, Auc-Advanced, Auctioneer
+## OptionalDeps: Blizzard_Professions, Auctionator, Auc-Advanced, Auctioneer, TradeSkillMaster
 ## SavedVariables: CraftingOrdersPlusPlusDB
 
 Locale.lua

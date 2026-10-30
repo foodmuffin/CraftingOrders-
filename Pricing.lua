@@ -37,7 +37,26 @@ local providers = {
 		key = "auctioneer",
 		name = "Auctioneer",
 	},
+	tsm = {
+		key = "tsm",
+		name = "TradeSkillMaster",
+	},
 }
+
+-- TSM price sources offered in the options. The first entry is the default.
+local TSM_PRICE_SOURCES = { "DBMinBuyout", "DBRecent", "DBMarket" }
+Pricing.TSM_PRICE_SOURCES = TSM_PRICE_SOURCES
+
+function Pricing:GetTSMPriceSource()
+	local selected = ns.GetConfig and ns.GetConfig("tsmPriceSource")
+	for _, key in ipairs(TSM_PRICE_SOURCES) do
+		if key == selected then
+			return key
+		end
+	end
+
+	return TSM_PRICE_SOURCES[1]
+end
 
 local function NormalizeUnitPrice(value)
 	if type(value) ~= "number" or value ~= value or value <= 0 then
@@ -189,6 +208,21 @@ local function GetAuctioneerPrice(item)
 	return NormalizeUnitPrice(ok and value or nil)
 end
 
+local function GetTSMPrice(item)
+	if not (TSM_API and type(TSM_API.GetCustomPriceValue) == "function") then
+		return nil
+	end
+
+	-- Reagent quality tiers are separate item IDs, so a plain "i:<id>" string prices each tier.
+	local itemID = ExtractItemID(item) or ExtractItemID(Util.GetItemLink(item))
+	if not itemID then
+		return nil
+	end
+
+	local ok, value = pcall(TSM_API.GetCustomPriceValue, Pricing:GetTSMPriceSource(), "i:" .. itemID)
+	return NormalizeUnitPrice(ok and value or nil)
+end
+
 function Pricing:RefreshProviders()
 	local config = ns.GetDatabase() or {}
 	local auctionatorDetected = ns.IsAddonLoaded("Auctionator")
@@ -200,10 +234,14 @@ function Pricing:RefreshProviders()
 		and AucAdvanced
 		and AucAdvanced.API
 		and type(AucAdvanced.API.GetMarketValue) == "function"
+	local tsmDetected = ns.IsAddonLoaded("TradeSkillMaster")
+		and TSM_API
+		and type(TSM_API.GetCustomPriceValue) == "function"
 
 	self.status = {
 		auctionatorDetected = not not auctionatorDetected,
 		auctioneerDetected = not not auctioneerDetected,
+		tsmDetected = not not tsmDetected,
 		detectedProviderKeys = {},
 	}
 
@@ -212,6 +250,9 @@ function Pricing:RefreshProviders()
 	end
 	if auctioneerDetected then
 		self.status.detectedProviderKeys[#self.status.detectedProviderKeys + 1] = providers.auctioneer.key
+	end
+	if tsmDetected then
+		self.status.detectedProviderKeys[#self.status.detectedProviderKeys + 1] = providers.tsm.key
 	end
 
 	self.status.auctioneerSnatchReady = self.status.auctioneerDetected
@@ -223,12 +264,13 @@ function Pricing:RefreshProviders()
 		or false
 
 	local selectedProviderKey = config.pricingSource
-	if selectedProviderKey ~= providers.auctionator.key and selectedProviderKey ~= providers.auctioneer.key then
+	if not providers[selectedProviderKey] then
 		selectedProviderKey = nil
 	end
 
 	local selectedIsDetected = (selectedProviderKey == providers.auctionator.key and auctionatorDetected)
 		or (selectedProviderKey == providers.auctioneer.key and auctioneerDetected)
+		or (selectedProviderKey == providers.tsm.key and tsmDetected)
 
 	if not selectedIsDetected then
 		selectedProviderKey = self.status.detectedProviderKeys[1]
@@ -303,6 +345,8 @@ function Pricing:GetPriceInfo(item, count)
 		unitPrice = GetAuctionatorPrice(item)
 	elseif provider.key == "auctioneer" then
 		unitPrice = GetAuctioneerPrice(item)
+	elseif provider.key == "tsm" then
+		unitPrice = GetTSMPrice(item)
 	else
 		return BuildPriceInfo(item, count, nil, "no_provider", nil, isMarketable)
 	end
@@ -413,6 +457,16 @@ function Pricing:ExportShoppingList(entries, listName)
 	end
 
 	if provider.key == "auctionator" then
+		return self:CreateAuctionatorShoppingList(entries, listName)
+	end
+
+	if provider.key == "tsm" then
+		-- TSM has no shopping-list API; the search list is independent of the price source,
+		-- so build it in Auctionator when that addon is available.
+		if not self.status.auctionatorDetected then
+			return false, L.ERR_TSM_EXPORT_NEEDS_AUCTIONATOR
+		end
+
 		return self:CreateAuctionatorShoppingList(entries, listName)
 	end
 

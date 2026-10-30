@@ -107,7 +107,7 @@ The addon's job is to make Patron orders faster to evaluate without replacing th
 
 - No `Knowledge: X` subtitle under reward icons.
 - If a reward grants more than 1 knowledge point, add a small star badge to the reward icon.
-- Reward valuation can include reward items if marketable and priced.
+- Reward valuation can include reward items if marketable and priced. Reward item value is net of the 5% auction house cut (`AUCTION_HOUSE_CUT_RATE`); the gold tip is not.
 - Bound or non-marketable rewards must not be treated as "no market data".
 
 ### Buttons and toolbar
@@ -244,6 +244,8 @@ Do not split the truth across multiple competing structures again.
 ### Planning behavior
 
 - The default plan is the cheapest valid mix, not the highest quality mix.
+  A higher reagent tier is used when it is priced lower than a lower tier and the plan still reaches the required quality without extra concentration. Unpriced options keep the lowest-tier fallback.
+  The green/amber tick still describes the lowest-tier plan; `FindCheapestMaterialPlan` only changes which plan is costed and exported.
 - Costing, shopping export, and quality simulation must stay aligned.
 - Mixed reagent qualities within a slot are allowed and sometimes necessary.
 - Required non-quality reagents must be included in the same plan.
@@ -280,6 +282,7 @@ Important:
 
 - Auctionator
 - Auctioneer
+- TradeSkillMaster (price source set by `tsmPriceSource`, default `DBMinBuyout`, through `TSM_API`; shopping export still goes through Auctionator)
 
 Only one pricing provider is selected at a time.
 
